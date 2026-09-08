@@ -3,7 +3,7 @@ import type { ToolSet } from "ai";
 
 export class ConversationAgent extends Think {
   override getModel() {
-    return "@cf/moonshotai/kimi-k2.7-code";
+    return "@cf/zai-org/glm-4.7-flash";
   }
 
   override getSystemPrompt(): string {
