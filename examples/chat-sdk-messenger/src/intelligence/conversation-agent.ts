@@ -1,4 +1,4 @@
-import { Think } from "@cloudflare/think";
+import { Think, type TurnContext, type TurnConfig } from "@cloudflare/think";
 import { tool, jsonSchema, type ToolSet } from "ai";
 
 interface SearchResult {
@@ -122,8 +122,32 @@ export async function searchWeb(query: string): Promise<string> {
     .join("\n\n");
 }
 
+function messageText(message: unknown): string {
+  if (!message || typeof message !== "object") return "";
+  const candidate = message as { role?: unknown; content?: unknown };
+  if (candidate.role !== "user") return "";
+  if (typeof candidate.content === "string") return candidate.content;
+  if (!Array.isArray(candidate.content)) return "";
+
+  return candidate.content
+    .map((part) => {
+      if (!part || typeof part !== "object") return "";
+      const text = (part as { text?: unknown }).text;
+      return typeof text === "string" ? text : "";
+    })
+    .filter(Boolean)
+    .join("\n");
+}
+
+function extractExplicitSearchQuery(text: string): string | null {
+  const match = text.match(
+    /(?:در\s+وب\s+جستجو\s+کن|در\s+اینترنت\s+جستجو\s+کن|وب\s+جستجو\s+کن|در\s+وب\s+سرچ\s+کن|سرچ\s+کن|جستجو\s+کن|search\s+the\s+web|search\s+online|search\s+the\s+internet)\s*:?[\s-]*(.+)$/iu
+  );
+  return match?.[1]?.trim() || null;
+}
+
 const webSearchTool = tool({
-  description: "Search the public web for current information and open the most relevant result pages. Use this whenever the user asks for web search, current information, research, documentation, prices, news, software versions, errors, or verification.",
+  description: "Search the public web for current information and open the most relevant result pages. Use this when the user asks for current information, web research, documentation, prices, news, software versions, errors, or verification and the answer cannot be reliably given from the conversation alone.",
   inputSchema: jsonSchema<{ query: string }>({
     type: "object",
     properties: {
@@ -147,18 +171,40 @@ export class ConversationAgent extends Think {
       "Use plain text or simple Markdown only.",
       "Do not expose hidden reasoning, tool calls, or internal state.",
       "",
-      "A server-side web_search tool is available to you for non-Telegram contexts.",
-      "For requests involving current information, web research, documentation, prices, news, software versions, errors, or facts that may have changed, use web_search when tool calling is supported.",
-      "If web search results are provided in the user message, treat them as research context and answer from them.",
-      "Do not say that you lack internet access when web search results are available.",
-      "Do not claim that you searched unless search results were actually provided or returned by the tool.",
+      "A server-side web_search tool is available.",
+      "Use web_search when the user asks for current information, web research, documentation, prices, news, software versions, errors, or facts that may have changed.",
+      "If web search results are provided in the turn context, use them as research context and do not search for the same request again.",
+      "Do not say that you lack internet access when web search is available or when search results are provided.",
+      "Do not claim that you searched unless search results were actually returned by the tool or provided in the turn context.",
       "Prefer official and primary sources for technical questions.",
-      "After searching, summarize the relevant findings and include the source URLs."
+      "After web research, summarize the relevant findings and include source URLs."
     ].join("\n");
   }
 
   override getTools(): ToolSet {
     return { web_search: webSearchTool };
+  }
+
+  override async beforeTurn(ctx: TurnContext): Promise<TurnConfig | void> {
+    // For an explicit search request, do the search before the model stream.
+    // This keeps the Telegram-visible stream text-only and prevents a second
+    // identical web_search tool call during the same turn.
+    if (ctx.continuation) return;
+
+    const latestUserMessage = [...ctx.messages].reverse().find((message) => {
+      return message.role === "user";
+    });
+    const query = extractExplicitSearchQuery(messageText(latestUserMessage));
+    if (!query) return;
+
+    const webResults = await searchWeb(query);
+    return {
+      system:
+        `${ctx.system}\n\n` +
+        `WEB SEARCH RESULTS FOR THIS TURN:\n${webResults}\n\n` +
+        `Use these results to answer the user's request. Do not call web_search again for this same request. Include relevant source URLs.` ,
+      activeTools: Object.keys(ctx.tools).filter((name) => name !== "web_search")
+    };
   }
 
   async resetConversation(): Promise<void> {
