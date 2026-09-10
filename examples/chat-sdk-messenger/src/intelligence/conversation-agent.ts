@@ -13,12 +13,14 @@ function stripHtml(value: string): string {
     .replace(/<script[\s\S]*?<\/script>/gi, "")
     .replace(/<style[\s\S]*?<\/style>/gi, "")
     .replace(/<[^>]+>/g, " ")
+    .replace(/<!\[CDATA\[|\]\]>/g, "")
     .replace(/&amp;/g, "&")
     .replace(/&quot;/g, '"')
     .replace(/&#39;/g, "'")
     .replace(/&lt;/g, "<")
     .replace(/&gt;/g, ">")
     .replace(/&#x27;/gi, "'")
+    .replace(/&#(\d+);/g, (_, code) => String.fromCharCode(Number(code)))
     .replace(/\s+/g, " ")
     .trim();
 }
@@ -32,75 +34,105 @@ async function fetchText(url: string, headers: HeadersInit = {}): Promise<string
       ...headers
     }
   });
-
-  if (!response.ok) {
-    throw new Error(`HTTP ${response.status} ${response.statusText}`);
-  }
-
+  if (!response.ok) throw new Error(`HTTP ${response.status} ${response.statusText}`);
   return response.text();
 }
 
-async function searchWithJina(query: string): Promise<string> {
-  const url = `https://s.jina.ai/${encodeURIComponent(query)}`;
-  const text = await fetchText(url, { Accept: "text/plain" });
-  const cleaned = text.trim();
-  if (!cleaned) throw new Error("Jina returned an empty response");
-  return cleanText(cleaned, 14000);
-}
-
-function parseBingRss(xml: string): string {
+async function searchWithBingRss(query: string): Promise<string> {
+  const url = `https://www.bing.com/search?format=rss&q=${encodeURIComponent(query)}`;
+  const xml = await fetchText(url, {
+    Accept: "application/rss+xml, application/xml, text/xml;q=0.9, */*;q=0.8"
+  });
   const items: string[] = [];
   const itemPattern = /<item>([\s\S]*?)<\/item>/gi;
   let itemMatch: RegExpExecArray | null;
-
   while ((itemMatch = itemPattern.exec(xml)) && items.length < 8) {
     const item = itemMatch[1];
     const title = item.match(/<title>([\s\S]*?)<\/title>/i)?.[1];
     const link = item.match(/<link>([\s\S]*?)<\/link>/i)?.[1];
     const description = item.match(/<description>([\s\S]*?)<\/description>/i)?.[1];
     if (!title || !link) continue;
-    items.push(
-      `${items.length + 1}. ${stripHtml(title)}\nURL: ${stripHtml(link)}\n${stripHtml(description || "")}`
-    );
+    items.push(`${items.length + 1}. ${stripHtml(title)}\nURL: ${stripHtml(link)}\nSnippet: ${stripHtml(description || "")}`);
   }
-
-  return items.join("\n\n");
+  if (!items.length) throw new Error("Bing RSS returned no results");
+  return `WEB SEARCH RESULTS (Bing RSS)\n\n${items.join("\n\n")}`;
 }
 
-async function searchWithBingRss(query: string): Promise<string> {
-  const url = `https://www.bing.com/search?format=rss&q=${encodeURIComponent(query)}`;
-  const xml = await fetchText(url, { Accept: "application/rss+xml, application/xml, text/xml;q=0.9, */*;q=0.8" });
-  const results = parseBingRss(xml);
-  if (!results) throw new Error("Bing RSS returned no results");
-  return results;
+async function searchWithJina(query: string): Promise<string> {
+  const text = await fetchText(`https://s.jina.ai/${encodeURIComponent(query)}`, { Accept: "text/plain" });
+  const cleaned = text.trim();
+  if (!cleaned) throw new Error("Jina returned an empty response");
+  return `WEB SEARCH RESULTS (Jina)\n\n${cleanText(cleaned, 14000)}`;
 }
 
 async function searchWithYahoo(query: string): Promise<string> {
-  const url = `https://search.yahoo.com/search?p=${encodeURIComponent(query)}`;
-  const html = await fetchText(url, { Accept: "text/html, */*;q=0.8" });
+  const html = await fetchText(`https://search.yahoo.com/search?p=${encodeURIComponent(query)}`, {
+    Accept: "text/html, */*;q=0.8"
+  });
   const text = stripHtml(html);
   if (!text) throw new Error("Yahoo returned an empty response");
-  return cleanText(text, 12000);
+  return `WEB SEARCH RESULTS (Yahoo)\n\n${cleanText(text, 12000)}`;
+}
+
+async function officialCloudflareSearch(query: string): Promise<string | null> {
+  if (!/(cloudflare|agents\s+sdk|cloudflare\s+agents)/iu.test(query)) return null;
+
+  const sources: string[] = [];
+
+  // npm is authoritative for the currently published SDK version.
+  if (/(latest|version|نسخه|ورژن|release|released)/iu.test(query)) {
+    try {
+      const npm = JSON.parse(await fetchText("https://registry.npmjs.org/agents/latest", {
+        Accept: "application/json"
+      })) as { name?: string; version?: string; homepage?: string };
+      if (npm.version) {
+        sources.push(`Official npm package: ${npm.name || "agents"}@${npm.version}\nURL: https://www.npmjs.com/package/agents\nPackage registry: https://registry.npmjs.org/agents/latest`);
+      }
+    } catch {
+      // Continue with Cloudflare's official changelog.
+    }
+  }
+
+  try {
+    const changelog = await fetchText("https://developers.cloudflare.com/changelog/product/agents/", {
+      Accept: "text/html, */*;q=0.8"
+    });
+    const text = stripHtml(changelog);
+    const terms = query.toLowerCase().split(/\s+/).filter((x) => x.length > 3).slice(0, 8);
+    const chunks = text.split(/(?=Agents SDK|Agents can|AgentsWorkers)/i);
+    const relevant = chunks
+      .filter((chunk) => terms.some((term) => chunk.toLowerCase().includes(term)))
+      .slice(0, 5)
+      .map((chunk) => cleanText(chunk, 3500));
+    if (relevant.length) {
+      sources.push(`Official Cloudflare Agents changelog:\nURL: https://developers.cloudflare.com/changelog/product/agents/\n${relevant.join("\n\n")}`);
+    }
+  } catch {
+    // General search below remains available.
+  }
+
+  return sources.length ? `OFFICIAL CLOUDFLARE RESULTS\n\n${sources.join("\n\n")}` : null;
 }
 
 async function webSearch(query: string): Promise<string> {
-  const errors: string[] = [];
+  // For Cloudflare questions, prefer first-party sources instead of generic search noise.
+  const official = await officialCloudflareSearch(query);
+  if (official) return official;
 
-  // Search is deliberately done with ordinary Worker fetch(), not Browser Run.
-  // This avoids the Free-plan Browser Run Quick Action 429 limit.
+  const errors: string[] = [];
+  // Do not use Browser Run for search. It has a strict Free-plan rate limit.
+  // Bing RSS is attempted first because it returns structured title/URL/snippet data.
   for (const [name, searcher] of [
-    ["Jina", searchWithJina],
     ["Bing RSS", searchWithBingRss],
+    ["Jina", searchWithJina],
     ["Yahoo", searchWithYahoo]
   ] as const) {
     try {
-      const results = await searcher(query);
-      return `WEB SEARCH RESULTS (${name})\n\n${results}`;
+      return await searcher(query);
     } catch (error) {
       errors.push(`${name}: ${String(error)}`);
     }
   }
-
   throw new Error(`No web results were available for: ${query}. ${errors.join(" | ")}`);
 }
 
@@ -138,6 +170,7 @@ export class ConversationAgent extends Think {
       "",
       "You have web search through ordinary Cloudflare Worker fetch() and Cloudflare Browser Run Quick Actions.",
       "Use web_search for current information, web research, documentation, prices, news, software versions, errors, and verification.",
+      "For Cloudflare questions, prefer the official Cloudflare changelog and official npm package data returned by web_search.",
       "Use fetch_to_markdown when you need the readable text of a URL.",
       "Use browse when you need rendered HTML or page structure after JavaScript execution.",
       "Use cf_web_fetch when you need a Cloudflare-hosted web fetch.",
@@ -151,7 +184,7 @@ export class ConversationAgent extends Think {
 
   override getTools(): ToolSet {
     const webSearchTool = tool({
-      description: "Search the public web using ordinary HTTP from the Cloudflare Worker. This does not consume Browser Run.",
+      description: "Search the public web using ordinary HTTP from the Cloudflare Worker. For Cloudflare questions it prioritizes official Cloudflare and npm sources. It does not consume Browser Run.",
       inputSchema: jsonSchema<{ query: string }>({
         type: "object",
         properties: { query: { type: "string", description: "Focused web search query" } },
