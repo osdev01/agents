@@ -1,11 +1,9 @@
 import type { Message, Thread } from "chat";
 import type { UIMessage } from "ai";
-import { searchWeb } from "./conversation-agent";
 
 const ASK_COMMAND = /^\/ask(?:@\w+)?(?:\s+|$)/i;
 const MENU_COMMAND = /^\/menu(?:@\w+)?(?:\s|$)/i;
 const RESET_COMMAND = /^\/reset(?:@\w+)?(?:\s|$)/i;
-const EXPLICIT_WEB_SEARCH = /(?:در\s+وب|در\s+اینترنت|وب\s+جستجو|جستجو\s+کن|سرچ\s+کن|روی\s+وب|search\s+the\s+web|web\s+search|search\s+online|look\s+it\s+up|browse\s+the\s+web)/i;
 
 export interface AiRoutingInput {
   isDM: boolean;
@@ -47,20 +45,9 @@ export async function toThinkUserMessage(message: Message): Promise<UIMessage> {
     message.author.fullName || message.author.userName || message.author.userId;
   const content = authorName ? `${authorName}: ${text}` : text;
 
-  if (EXPLICIT_WEB_SEARCH.test(text)) {
-    const webContext = await searchWeb(text);
-    return {
-      id: `telegram:${message.id}`,
-      role: "user",
-      parts: [
-        {
-          type: "text",
-          text: `${content}\n\nWEB SEARCH RESULTS:\n${webContext}\n\nAnswer the user's request using these results. Cite the source URLs. Do not say you lack internet access.`
-        }
-      ]
-    };
-  }
-
+  // Web research is handled centrally by ConversationAgent.beforeTurn().
+  // Do not search here: doing so duplicates the request and can corrupt
+  // the durable Think turn/message lifecycle.
   return {
     id: `telegram:${message.id}`,
     role: "user",
