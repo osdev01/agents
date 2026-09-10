@@ -122,7 +122,7 @@ function extractExplicitSearchQuery(text: string): string | null {
 export class ConversationAgent extends Think {
   override getModel() {
     const provider = createOpenAI({ apiKey: this.env.BAI_API_KEY, baseURL: this.env.BAI_BASE_URL });
-    return provider("ling-3.0-flash-fin-free");
+    return provider(this.env.BAI_MODEL || "ling-3.0-flash-fin-free");
   }
 
   override getSystemPrompt(): string {
