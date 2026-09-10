@@ -19,23 +19,23 @@ function decodeHtml(value: string): string {
 function stripHtml(value: string): string {
   return decodeHtml(
     value
-      .replace(/<script[\\s\\S]*?<\\/script>/gi, " ")
-      .replace(/<style[\\s\\S]*?<\\/style>/gi, " ")
+      .replace(/<script[\s\S]*?<\/script>/gi, " ")
+      .replace(/<style[\s\S]*?<\/style>/gi, " ")
       .replace(/<[^>]+>/g, " ")
-      .replace(/\\s+/g, " ")
+      .replace(/\s+/g, " ")
       .trim()
   );
 }
 
-function parseSearchResults(html: string): SearchResult[] {
+function parseDuckDuckGo(html: string): SearchResult[] {
   const results: SearchResult[] = [];
-  const pattern = /<a[^>]+class=[\"']result__a[\"'][^>]+href=[\"']([^\"']+)[\"'][^>]*>([\\s\\S]*?)<\\/a>/gi;
+  const pattern = /<a[^>]+class=["'][^"']*result__a[^"']*["'][^>]+href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi;
   let match: RegExpExecArray | null;
 
   while ((match = pattern.exec(html)) && results.length < 5) {
     let url = decodeHtml(match[1]);
     const title = stripHtml(match[2]);
-    const redirect = url.match(/[?&]uddg=([^&]+)/);
+    const redirect = url.match(/[?&](?:uddg)=([^&]+)/i);
     if (redirect) {
       try {
         url = decodeURIComponent(redirect[1]);
@@ -43,58 +43,80 @@ function parseSearchResults(html: string): SearchResult[] {
         // Keep the original URL when decoding fails.
       }
     }
-    if (!/^https?:\\/\\//i.test(url) || !title) continue;
+    if (!/^https?:\/\//i.test(url) || !title) continue;
 
-    const from = match.index;
-    const nearby = html.slice(from, from + 5000);
-    const snippetMatch = nearby.match(/<a[^>]+class=[\"']result__snippet[\"'][^>]*>([\\s\\S]*?)<\\/a>|<div[^>]+class=[\"'][^\"']*result__snippet[^\"']*[\"'][^>]*>([\\s\\S]*?)<\\/div>/i);
+    const nearby = html.slice(match.index, match.index + 7000);
+    const snippetMatch = nearby.match(
+      /<(?:a|div)[^>]+class=["'][^"']*result__snippet[^"']*["'][^>]*>([\s\S]*?)<\/(?:a|div)>/i
+    );
+
     results.push({
       title,
       url,
-      snippet: stripHtml(snippetMatch?.[1] ?? snippetMatch?.[2] ?? "")
+      snippet: stripHtml(snippetMatch?.[1] ?? "")
     });
   }
 
   return results;
 }
 
+async function searchEngine(url: string): Promise<SearchResult[]> {
+  const response = await fetch(url, {
+    headers: {
+      "User-Agent": "Mozilla/5.0 (compatible; CloudflareAgent/1.0; +https://developers.cloudflare.com/workers/)"
+    }
+  });
+  if (!response.ok) throw new Error(`Search engine returned HTTP ${response.status}`);
+  return parseDuckDuckGo(await response.text());
+}
+
 function extractPageText(html: string): string {
-  const main = html.match(/<main[\\s\\S]*?<\\/main>/i)?.[0]
-    ?? html.match(/<article[\\s\\S]*?<\\/article>/i)?.[0]
+  const main = html.match(/<main[\s\S]*?<\/main>/i)?.[0]
+    ?? html.match(/<article[\s\S]*?<\/article>/i)?.[0]
     ?? html;
-  return stripHtml(main).slice(0, 12000);
+  return stripHtml(main).slice(0, 8000);
 }
 
 const webSearchTool = tool({
-  description: "Search the public web for current information. Use this for questions that need fresh web research.",
+  description: "Search the public web for current information and open the most relevant result pages. Use this whenever the user asks for web search, current information, research, documentation, or verification.",
   inputSchema: jsonSchema<{ query: string }>({
     type: "object",
-    properties: { query: { type: "string", description: "The web search query" } },
+    properties: {
+      query: { type: "string", description: "A focused web search query" }
+    },
     required: ["query"],
     additionalProperties: false
   }),
   execute: async ({ query }) => {
-    const searchUrl = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`;
-    const response = await fetch(searchUrl, {
-      headers: {
-        "User-Agent": "Mozilla/5.0 (compatible; CloudflareAgent/1.0)"
-      }
-    });
-    if (!response.ok) throw new Error(`Web search failed with HTTP ${response.status}`);
+    let results: SearchResult[] = [];
+    let searchError = "";
 
-    const results = parseSearchResults(await response.text());
-    if (results.length === 0) return "No web results found.";
+    try {
+      results = await searchEngine(
+        `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`
+      );
+    } catch (error) {
+      searchError = String(error);
+    }
+
+    if (results.length === 0) {
+      return `No web results were available for: ${query}${searchError ? ` (${searchError})` : ""}`;
+    }
 
     const pages = await Promise.all(
       results.slice(0, 3).map(async (result) => {
         try {
           const page = await fetch(result.url, {
-            headers: { "User-Agent": "Mozilla/5.0 (compatible; CloudflareAgent/1.0)" },
+            headers: {
+              "User-Agent": "Mozilla/5.0 (compatible; CloudflareAgent/1.0)"
+            },
             redirect: "follow"
           });
           if (!page.ok) return { ...result, content: `HTTP ${page.status}` };
           const contentType = page.headers.get("content-type") ?? "";
-          if (!contentType.includes("text/html")) return { ...result, content: contentType };
+          if (!contentType.includes("text/html")) {
+            return { ...result, content: `Non-HTML response: ${contentType}` };
+          }
           return { ...result, content: extractPageText(await page.text()) };
         } catch (error) {
           return { ...result, content: `Could not fetch page: ${String(error)}` };
@@ -103,7 +125,10 @@ const webSearchTool = tool({
     );
 
     return pages
-      .map((page, index) => `${index + 1}. ${page.title}\nURL: ${page.url}\nSnippet: ${page.snippet}\nContent: ${page.content}`)
+      .map(
+        (page, index) =>
+          `${index + 1}. ${page.title}\nURL: ${page.url}\nSnippet: ${page.snippet}\nContent: ${page.content}`
+      )
       .join("\n\n");
   }
 });
@@ -120,11 +145,13 @@ export class ConversationAgent extends Think {
       "Use plain text or simple Markdown only.",
       "Do not expose hidden reasoning, tool calls, or internal state.",
       "",
-      "You have a web_search tool for current web research.",
-      "Use it whenever the user asks you to search the web, research a current topic, inspect a public webpage, or verify current documentation.",
-      "Do not claim to have searched the web unless you actually used the tool.",
-      "Prefer recent primary sources and official documentation when researching technical topics.",
-      "Summarize useful results and include the source URLs in the answer."
+      "A server-side web_search tool is available to you.",
+      "For any request involving current information, web research, a website, documentation, prices, news, software versions, errors, or facts that may have changed, call web_search before answering.",
+      "If the user explicitly asks to search the web, you MUST call web_search.",
+      "Do not say that you lack internet access when web_search is available.",
+      "Do not claim that you searched unless the tool returned results.",
+      "Prefer official and primary sources for technical questions.",
+      "After searching, summarize the relevant findings and include the source URLs."
     ].join("\n");
   }
 
