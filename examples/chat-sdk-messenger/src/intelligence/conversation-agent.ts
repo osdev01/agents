@@ -157,7 +157,7 @@ export class ConversationAgent extends Think {
 
   override beforeTurn(ctx: { messages: Array<{ role?: string; content?: unknown }> }) {
     const lastMessage = ctx.messages[ctx.messages.length - 1];
-    const text = typeof lastMessage?.content === "string" ? lastMessage.content : "";
+    const text = lastMessage?.content == null ? "" : JSON.stringify(lastMessage.content);
     const explicitSearch = /(?:در\s+وب|در\s+اینترنت|وب\s+جستجو|جستجو\s+کن|سرچ\s+کن|روی\s+وب|search\s+the\s+web|web\s+search|search\s+online|look\s+it\s+up|browse\s+the\s+web)/i.test(text);
 
     if (explicitSearch) {
