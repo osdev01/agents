@@ -1,5 +1,4 @@
 import { cloudflare } from "@cloudflare/vite-plugin";
-import codemode from "@cloudflare/codemode/vite";
 import tailwindcss from "@tailwindcss/vite";
 import react from "@vitejs/plugin-react";
 import agents from "agents/vite";
@@ -9,7 +8,6 @@ export default defineConfig({
   plugins: [
     agents(),
     react(),
-    codemode(),
     cloudflare({ tunnel: { autoStart: true } }),
     tailwindcss()
   ]
