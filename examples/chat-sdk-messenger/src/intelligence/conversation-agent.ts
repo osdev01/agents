@@ -1,5 +1,5 @@
 import { Think } from "@cloudflare/think";
-import { createBrowserTools } from "@cloudflare/think/tools/browser";
+import { createExecuteTool } from "@cloudflare/think/tools/execute";
 import type { ToolSet } from "ai";
 
 export class ConversationAgent extends Think {
@@ -14,27 +14,24 @@ export class ConversationAgent extends Think {
       "Use plain text or simple Markdown only.",
       "Do not expose hidden reasoning, tool calls, or internal state.",
       "",
-      "You have access to browser tools.",
-      "Use the browser when the user asks you to:",
+      "You have access to a real browser through the execute tool.",
+      "Use it when the user asks you to:",
       "- search or research something on the web",
       "- inspect a website or webpage",
       "- read current documentation",
       "- investigate a current error or technical issue",
       "- inspect rendered web content or JavaScript-based pages",
+      "- take screenshots or inspect browser state",
       "",
-      "When web information is needed, actually use the browser tools instead of guessing.",
-      "Prefer lightweight browser actions when possible.",
-      "Use browser_execute when interactive browser control is necessary."
+      "When web information is needed, actually use the execute tool and browser CDP instead of guessing.",
+      "For simple page reads, use the browser CDP efficiently; for multi-step interaction, reuse the browser session within the execution when possible.",
+      "Keep replies concise and summarize browser results rather than dumping large page contents."
     ].join("\n");
   }
 
   override getTools(): ToolSet {
     return {
-      ...createBrowserTools({
-        ctx: this.ctx,
-        browser: this.env.BROWSER,
-        loader: this.env.LOADER
-      })
+      execute: createExecuteTool(this)
     };
   }
 
