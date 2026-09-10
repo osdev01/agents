@@ -4,7 +4,7 @@
   "browser": { "binding": "BROWSER" },
   "worker_loaders": [{ "binding": "LOADER" }],
   "name": "chat-sdk-messenger",
-  "main": "src/index.ts",
+  "main": "src/worker.ts",
   "compatibility_date": "2026-06-11",
   "compatibility_flags": ["nodejs_compat"],
   "assets": {
