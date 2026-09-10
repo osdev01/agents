@@ -465,7 +465,7 @@ export class ChatIngressAgent extends Agent {
     try {
       await thread.startTyping("Thinking...");
       agent = await this.getConversationAgent(thread);
-      await agent.chat(toThinkUserMessage(message), callback);
+      await agent.chat(await toThinkUserMessage(message), callback);
       completedModelTurn = true;
       callback.close();
       await post;
