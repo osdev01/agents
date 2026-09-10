@@ -27,12 +27,11 @@ function extractLinks(html: string): { title: string; url: string }[] {
   return results;
 }
 
-async function browserWebSearch(browser: Env["BROWSER"], query: string): Promise<string> {
-  const url = `https://www.google.com/search?q=${encodeURIComponent(query)}&num=8&hl=en&gbv=1`;
-  const html = await browserContent(browser, { url });
+async function readSearchResults(browser: Env["BROWSER"], searchUrl: string, engine: string): Promise<string> {
+  const html = await browserContent(browser, { url: searchUrl });
   const links = extractLinks(html);
   if (links.length === 0) {
-    return `No search results were extracted for: ${query}\nSearch page content:\n${cleanText(html, 5000)}`;
+    throw new Error(`${engine}: no search results extracted`);
   }
 
   const pages = await Promise.all(
@@ -47,6 +46,30 @@ async function browserWebSearch(browser: Env["BROWSER"], query: string): Promise
   );
 
   return pages.join("\n\n");
+}
+
+async function browserWebSearch(browser: Env["BROWSER"], query: string): Promise<string> {
+  const engines = [
+    {
+      name: "Google",
+      url: `https://www.google.com/search?q=${encodeURIComponent(query)}&num=8&hl=en&gbv=1`
+    },
+    {
+      name: "Bing",
+      url: `https://www.bing.com/search?q=${encodeURIComponent(query)}&count=8`
+    }
+  ];
+  const errors: string[] = [];
+
+  for (const engine of engines) {
+    try {
+      return await readSearchResults(browser, engine.url, engine.name);
+    } catch (error) {
+      errors.push(`${engine.name}: ${String(error)}`);
+    }
+  }
+
+  return `No web results were available for: ${query}\nSearch attempts: ${errors.join(" | ")}`;
 }
 
 function messageText(message: unknown): string {
@@ -106,7 +129,7 @@ export class ConversationAgent extends Think {
     });
 
     const webSearch = tool({
-      description: "Search Google through Cloudflare Browser Run, then read the most relevant result pages. Use for current web research and verification.",
+      description: "Search Google and Bing through Cloudflare Browser Run, then read the most relevant result pages. Use for current web research and verification.",
       inputSchema: jsonSchema<{ query: string }>({
         type: "object",
         properties: { query: { type: "string", description: "Focused web search query" } },
@@ -176,7 +199,7 @@ export class ConversationAgent extends Think {
       system:
         `${ctx.system}\n\nWEB RESEARCH RESULTS FOR THIS TURN:\n${webResults}\n\n` +
         "Use these results to answer the user's request. Do not repeat the same search.",
-      activeTools: Object.keys(ctx.tools)
+      activeTools: Object.keys(ctx.tools).filter((name) => name !== "web_search")
     };
   }
 
