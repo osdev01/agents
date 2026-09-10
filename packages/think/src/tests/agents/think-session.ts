@@ -2789,6 +2789,25 @@ export class ThinkAgentToolParent extends Agent {
   }
 
   /**
+   * A parent that attaches only after the child completed must still find
+   * the child's stored chunks: the child's cutover keeps its rows for the
+   * parent, which the child's next `start()` reclaims.
+   */
+  async readCompletedChildChunksForTest(
+    input: string,
+    runId = crypto.randomUUID()
+  ): Promise<{ status: string; chunks: number }> {
+    const child = await this.subAgent(ThinkTestAgent, runId);
+    await child.startAgentToolRun(input, { runId });
+    const inspection = await this.waitForTerminalInspectionForTest(
+      child,
+      runId
+    );
+    const chunks = await child.getAgentToolChunks(runId);
+    return { status: inspection.status, chunks: chunks.length };
+  }
+
+  /**
    * A still-running child that reaches terminal *during* the parent's bounded
    * re-attach window: reconciliation should tail it to terminal and finalize
    * the parent row `completed` instead of abandoning it `interrupted` (#1630).
@@ -4975,10 +4994,13 @@ export class ThinkToolsTestAgent extends Think {
       VALUES (${streamId}, ${state}, ${requestId}, ${JSON.stringify({ cfChat: 1 })},
               ${chunks.length}, ${now}, ${now}, ${closedAt})
     `;
-    for (const chunk of chunks) {
+    if (chunks.length > 0) {
+      const body = chunks.map((c) => JSON.stringify(c.body)).join(",");
       this.sql`
-        INSERT INTO cf_agents_stream_chunks (stream_id, seq, chunk, created_at)
-        VALUES (${streamId}, ${chunk.index}, ${JSON.stringify(chunk.body)}, ${now})
+        INSERT INTO cf_agents_stream_blocks
+          (stream_id, block, seq_from, seq_to, body, created_at, updated_at)
+        VALUES (${streamId}, 0, ${chunks[0].index}, ${chunks[chunks.length - 1].index + 1},
+                ${body}, ${now}, ${now})
       `;
     }
   }
@@ -6869,10 +6891,14 @@ export class ThinkRecoveryTestAgent extends Think {
    *  partial. The recovery budget keys off this counter (not the live message
    *  count), so this is how a test marks "the turn advanced". */
   async bumpRecoveryProgressForTest(): Promise<void> {
-    const self = this as unknown as {
-      _bumpChatRecoveryProgress(): Promise<void>;
-    };
-    await self._bumpChatRecoveryProgress();
+    // One explicit credit — the same unit a flushed segment or a forwarded
+    // child chunk adds to the derived marker.
+    this._resumableStream.creditProgress();
+  }
+
+  /** The recovery progress marker as the engine would read it now. */
+  async readProgressMarkerForTest(): Promise<number> {
+    return this._resumableStream.progressMarker();
   }
 
   /** Simulate compaction collapsing the transcript by dropping all assistant
@@ -6910,7 +6936,7 @@ export class ThinkRecoveryTestAgent extends Think {
       self._storeChunkDurably(streamId, chunk, JSON.stringify(chunk), state);
     const rawCount = (): number => {
       const rows = this.sql<{ count: number }>`
-        SELECT COUNT(*) as count FROM cf_agents_stream_chunks
+        SELECT COALESCE(MAX(seq_to), 0) as count FROM cf_agents_stream_blocks
         WHERE stream_id = ${streamId}
       `;
       return rows[0]?.count ?? 0;
@@ -6948,7 +6974,7 @@ export class ThinkRecoveryTestAgent extends Think {
       _persistOrphanedStream(streamId: string): Promise<void>;
     };
     const read = async (): Promise<number> =>
-      (await this.ctx.storage.get<number>("cf:chat-recovery:progress")) ?? 0;
+      this._resumableStream.progressMarker();
 
     const start = await read();
     const streamId = self._resumableStream.start("req-progress-immunity");
@@ -7000,7 +7026,7 @@ export class ThinkRecoveryTestAgent extends Think {
     };
     self._lastAgentToolStreamProgressAt = 0;
     const read = async (): Promise<number> =>
-      (await this.ctx.storage.get<number>("cf:chat-recovery:progress")) ?? 0;
+      this._resumableStream.progressMarker();
     const start = await read();
     const bodies = Array.from({ length: chunks }, (_, i) => ({
       body: `chunk-${i}`
@@ -7775,10 +7801,13 @@ export class ThinkRecoveryTestAgent extends Think {
       VALUES (${streamId}, ${state}, ${requestId}, ${JSON.stringify({ cfChat: 1 })},
               ${chunks.length}, ${now}, ${now}, ${closedAt})
     `;
-    for (const chunk of chunks) {
+    if (chunks.length > 0) {
+      const body = chunks.map((c) => JSON.stringify(c.body)).join(",");
       this.sql`
-        INSERT INTO cf_agents_stream_chunks (stream_id, seq, chunk, created_at)
-        VALUES (${streamId}, ${chunk.index}, ${JSON.stringify(chunk.body)}, ${now})
+        INSERT INTO cf_agents_stream_blocks
+          (stream_id, block, seq_from, seq_to, body, created_at, updated_at)
+        VALUES (${streamId}, 0, ${chunks[0].index}, ${chunks[chunks.length - 1].index + 1},
+                ${body}, ${now}, ${now})
       `;
     }
   }
@@ -7835,11 +7864,9 @@ export class ThinkRecoveryTestAgent extends Think {
     )._startResumableStream(requestId);
   }
 
-  /** Invoke the alarm-driven cleanup callback directly. */
-  async runStreamCleanupForTest(): Promise<void> {
-    await (
-      this as unknown as { _cleanupStreamBuffers(): Promise<void> }
-    )._cleanupStreamBuffers();
+  /** Reclaim leftover streams now, as the next stream start does. */
+  async runStreamCleanupForTest(nowMs?: number): Promise<number> {
+    return this._resumableStream.reclaim(nowMs);
   }
 
   /** Finish a stream via the cleanup-arming wrapper (mirrors a real turn end). */
@@ -7847,43 +7874,6 @@ export class ThinkRecoveryTestAgent extends Think {
     (
       this as unknown as { _completeResumableStream(id: string): void }
     )._completeResumableStream(streamId);
-  }
-
-  /** Arm the cleanup alarm without finishing a stream (leaves no new buffer). */
-  async armStreamCleanupForTest(): Promise<void> {
-    await (
-      this as unknown as { _ensureStreamCleanupScheduled(): Promise<void> }
-    )._ensureStreamCleanupScheduled();
-  }
-
-  /**
-   * The delay (seconds) of the pending cleanup schedule, or null if none.
-   * Locks the arming interval (STREAM_CLEANUP_DELAY_SECONDS) so a regression
-   * that lengthens it back toward the old 24h leak window is caught.
-   */
-  async streamCleanupScheduleDelaySecondsForTest(): Promise<number | null> {
-    const rows = this.sql<{ delayInSeconds: number | null }>`
-      SELECT json_extract(payload, '$.delayInSeconds') AS delayInSeconds
-      FROM cf_agents_jobs
-      WHERE capability = 'scheduler' AND fn = '_cleanupStreamBuffers'
-      LIMIT 1
-    `;
-    return rows[0]?.delayInSeconds ?? null;
-  }
-
-  /**
-   * Backdate any pending cleanup schedule so it is due, then run the REAL
-   * `alarm()` handler. This exercises the production path where `alarm()`
-   * deletes the fired one-shot row after the callback returns — so a re-arm
-   * must create a fresh row to survive (the idempotent-reschedule footgun).
-   */
-  async fireDueCleanupAlarmForTest(): Promise<void> {
-    this.sql`
-      UPDATE cf_agents_jobs
-      SET time = ${Date.now() - 1_000}
-      WHERE capability = 'scheduler' AND fn = '_cleanupStreamBuffers'
-    `;
-    await this.alarm();
   }
 
   async insertInterruptedFiber(
@@ -8483,6 +8473,112 @@ export class ThinkWindowedHydrationAgent extends Think {
     return (await this.syncMessagesFromStorage()).length;
   }
 
+  /**
+   * Growth the refresh never measured: a tool result that enlarges a cached
+   * message, and an append whose text is multibyte. Both must be charged in
+   * bytes against the 64 KB budget, so the cache stops claiming to cover the
+   * path even though nothing was re-read.
+   */
+  async growCachePastBudgetForTest(): Promise<{
+    coversAfterSync: boolean;
+    coversAfterUpdate: boolean;
+    coversAfterMultibyteAppend: boolean;
+  }> {
+    const internal = this as unknown as {
+      _applyToolResult(toolCallId: string, output: unknown): Promise<void>;
+      _cacheCoversActivePath: boolean;
+    };
+    await this.session.appendMessage({
+      id: "grow-user",
+      role: "user",
+      parts: [{ type: "text", text: "run it" }]
+    });
+    await this.session.appendMessage({
+      id: "grow-assistant",
+      role: "assistant",
+      parts: [
+        {
+          type: "tool-client_action",
+          toolCallId: "tc-grow",
+          toolName: "client_action",
+          state: "input-available",
+          input: {}
+        }
+      ]
+    } as unknown as UIMessage);
+    await this.syncMessagesFromStorage();
+    const coversAfterSync = internal._cacheCoversActivePath;
+
+    // A 70 KB result on a message the cache already holds: an update, not an
+    // append, and alone larger than the budget.
+    await internal._applyToolResult("tc-grow", "y".repeat(70_000));
+    const coversAfterUpdate = internal._cacheCoversActivePath;
+
+    // Reset by refreshing (the update re-windows), then grow by an append
+    // of 40 000 two-byte characters: 40 KB of string length, 80 KB stored.
+    await this.session.clearMessages();
+    await this.syncMessagesFromStorage();
+    await this.session.appendMessage({
+      id: "grow-multibyte",
+      role: "user",
+      parts: [{ type: "text", text: "é".repeat(40_000) }]
+    });
+    const coversAfterMultibyteAppend = internal._cacheCoversActivePath;
+
+    return { coversAfterSync, coversAfterUpdate, coversAfterMultibyteAppend };
+  }
+
+  /**
+   * A tool result whose owner has fallen outside the hydration window. The
+   * live cache cannot name the row, so the apply must fall back to storage —
+   * and still land: the row is updated even though `this.messages` never
+   * held it.
+   */
+  async applyToolResultOutsideWindowForTest(): Promise<{
+    inCache: boolean;
+    cacheCoversPath: boolean;
+    storedState: string | undefined;
+  }> {
+    await this.session.appendMessage({
+      id: "old-owner",
+      role: "assistant",
+      parts: [
+        {
+          type: "tool-client_action",
+          toolCallId: "tc-old",
+          toolName: "client_action",
+          state: "input-available",
+          input: { action: "late" }
+        }
+      ]
+    } as unknown as UIMessage);
+    // Four 30KB messages push the owner past the 64KB window.
+    for (let i = 0; i < 4; i++) {
+      await this.session.appendMessage({
+        id: `after-${i}`,
+        role: i % 2 === 0 ? "user" : "assistant",
+        parts: [{ type: "text", text: `after ${i} ${"y".repeat(30_000)}` }]
+      });
+    }
+    await this.syncMessagesFromStorage();
+    const inCache = this.messages.some((m) => m.id === "old-owner");
+    const internal = this as unknown as {
+      _applyToolResult(toolCallId: string, output: unknown): Promise<void>;
+      _cacheCoversActivePath: boolean;
+    };
+    await internal._applyToolResult("tc-old", "late result");
+    const stored = await this.session.getMessage("old-owner");
+    const part = stored?.parts.find(
+      (candidate) =>
+        (candidate as { toolCallId?: string }).toolCallId === "tc-old"
+    ) as { state?: string } | undefined;
+    return {
+      inCache,
+      cacheCoversPath: internal._cacheCoversActivePath,
+      storedState: part?.state
+    };
+  }
+
   async testChat(message: string): Promise<TestChatResult> {
     const cb = new TestCollectingCallback();
     await this.chat(message, cb);
@@ -8582,6 +8678,46 @@ export class ThinkMediaEvictionAgent extends Think {
     }
   }
 
+  /**
+   * An append that lands while a pass is running. The pass read its
+   * candidates before the append, so it cannot evict what the append aged;
+   * the request must survive the pass and run afterwards. Seeds two aged
+   * media rows, starts a pass, and while it runs appends a third media
+   * message plus the fillers that age it. Returns what the first pass
+   * evicted (the two it saw) and the id the follow-up pass must handle.
+   */
+  async appendDuringPassForTest(): Promise<{
+    firstPassMessages: number;
+    lateId: string;
+  }> {
+    await this.seedMediaHistoryForTest("m");
+    this.mediaEviction = { keepRecentMessages: 2, minPartBytes: 10_000 };
+    const pass = this._evictAgedMediaBestEffort();
+    // Let the pass read its row stats and enter its first eviction write.
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    await this.appendMessageToHistory({
+      id: "late-media",
+      role: "user",
+      parts: [
+        { type: "text", text: "one more" },
+        {
+          type: "file",
+          mediaType: "image/png",
+          url: `data:image/png;base64,${"C".repeat(BIG_MEDIA_CHARS)}`
+        }
+      ]
+    } as UIMessage);
+    for (let i = 0; i < 4; i++) {
+      await this.appendMessageToHistory({
+        id: `late-${i}`,
+        role: i % 2 === 0 ? "assistant" : "user",
+        parts: [{ type: "text", text: `late ${i}` }]
+      } as UIMessage);
+    }
+    const first = await pass;
+    return { firstPassMessages: first?.messages ?? 0, lateId: "late-media" };
+  }
+
   /** One bounded Think-owned eviction pass. */
   async runEvictionForTest(): Promise<{
     messages: number;
@@ -8650,6 +8786,110 @@ export class ThinkMediaEvictionAgent extends Think {
  */
 export class ThinkMediaEvictionAutoAgent extends ThinkMediaEvictionAgent {
   override hydrationByteBudget = 1024;
+
+  /**
+   * Media that a pass had to protect, then aged by appends alone. The first
+   * pass on the windowed cache finds nothing aged and records that; the
+   * appends that follow never refresh the hydration snapshot, so only the
+   * append count can re-arm the pass. Seeds two fillers and two media
+   * messages (the media newest, so protected), refreshes so the cache is
+   * windowed, then appends four fillers to age the media.
+   */
+  async ageProtectedMediaByAppendsForTest(): Promise<string[]> {
+    const media = `data:image/png;base64,${"A".repeat(16_000)}`;
+    for (let i = 0; i < 2; i++) {
+      await this.appendMessageToHistory({
+        id: `pre-${i}`,
+        role: i % 2 === 0 ? "user" : "assistant",
+        parts: [{ type: "text", text: `filler ${i}` }]
+      } as UIMessage);
+    }
+    for (let i = 0; i < 2; i++) {
+      await this.appendMessageToHistory({
+        id: `media-${i}`,
+        role: i % 2 === 0 ? "user" : "assistant",
+        parts: [
+          { type: "text", text: `shot ${i}` },
+          { type: "file", mediaType: "image/png", url: media }
+        ]
+      } as UIMessage);
+    }
+    await this.syncMessagesFromStorage();
+    // Let the refresh's pass run and record nothing aged.
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    for (let i = 0; i < 4; i++) {
+      await this.appendMessageToHistory({
+        id: `post-${i}`,
+        role: i % 2 === 0 ? "user" : "assistant",
+        parts: [{ type: "text", text: `later ${i}` }]
+      } as UIMessage);
+    }
+    return ["media-0", "media-1"];
+  }
+
+  /**
+   * Appends that land while a FRUITLESS pass is running on the windowed
+   * cache. The pass records what it saw when it ends; the appends that
+   * arrived meanwhile must count toward re-arming it, or the request they
+   * left pending is suppressed until as many appends again. The pass is
+   * held open by slowing its row-stats read.
+   */
+  async appendDuringFruitlessPassForTest(): Promise<{
+    ids: string[];
+    runningAtAppend: boolean;
+    firstPassMessages: number;
+  }> {
+    const media = `data:image/png;base64,${"D".repeat(16_000)}`;
+    for (let i = 0; i < 2; i++) {
+      await this.appendMessageToHistory({
+        id: `fpre-${i}`,
+        role: i % 2 === 0 ? "user" : "assistant",
+        parts: [{ type: "text", text: `filler ${i}` }]
+      } as UIMessage);
+    }
+    for (let i = 0; i < 2; i++) {
+      await this.appendMessageToHistory({
+        id: `fmedia-${i}`,
+        role: i % 2 === 0 ? "user" : "assistant",
+        parts: [
+          { type: "text", text: `shot ${i}` },
+          { type: "file", mediaType: "image/png", url: media }
+        ]
+      } as UIMessage);
+    }
+    await this.syncMessagesFromStorage();
+    // The refresh's own pass runs and records nothing aged.
+    await new Promise((resolve) => setTimeout(resolve, 150));
+
+    // Hold the next pass open AFTER its row-stats read, so it finishes
+    // fruitless on stats that predate the appends below.
+    const session = this.session as unknown as {
+      getHistoryRowStats: (...args: unknown[]) => Promise<unknown>;
+    };
+    const stats = session.getHistoryRowStats.bind(session);
+    session.getHistoryRowStats = async (...args: unknown[]) => {
+      const rows = await stats(...args);
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      return rows;
+    };
+    const internal = this as unknown as { _mediaEvictionRunning: boolean };
+    const pass = this._evictAgedMediaBestEffort();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const runningAtAppend = internal._mediaEvictionRunning;
+    for (let i = 0; i < 4; i++) {
+      await this.appendMessageToHistory({
+        id: `fpost-${i}`,
+        role: i % 2 === 0 ? "user" : "assistant",
+        parts: [{ type: "text", text: `later ${i}` }]
+      } as UIMessage);
+    }
+    const result = await pass;
+    return {
+      ids: ["fmedia-0", "fmedia-1"],
+      runningAtAppend,
+      firstPassMessages: result?.messages ?? 0
+    };
+  }
 }
 
 // ── Pointer-inflation hydration (#1710) ─────────────────────────
