@@ -122,7 +122,7 @@ function extractExplicitSearchQuery(text: string): string | null {
 export class ConversationAgent extends Think {
   override getModel() {
     const provider = createOpenAI({ apiKey: this.env.BAI_API_KEY, baseURL: this.env.BAI_BASE_URL });
-    return provider(this.env.BAI_MODEL || "ling-3.0-flash-fin-free");
+    return provider("laguna-s-2.1");
   }
 
   override getSystemPrompt(): string {
@@ -159,13 +159,11 @@ export class ConversationAgent extends Think {
     });
     const browse = tool({
       description: "Open a public URL in Cloudflare Browser Run and return rendered HTML. Use only when page rendering or JavaScript is needed.",
-      inputSchema: jsonSchema<{ url: string }>({ type: "object", properties: { url: { type: "string", description: "Public URL to browse" } }, required: ["url"], additionalProperties: false }),
-      execute: async ({ url }) => browserContent(this.env.BROWSER, { url })
+      inputSchema: jsonSchema<{ url: string }>({ type: "object", properties: { url: { type: "string", description: "Public URL to browse" } }, required: ["url"], execute: async ({ url }) => browserContent(this.env.BROWSER, { url })
     });
     const cfWebFetch = tool({
       description: "Fetch a public URL through Cloudflare Browser Run. Return Markdown when possible, otherwise rendered content.",
-      inputSchema: jsonSchema<{ url: string }>({ type: "object", properties: { url: { type: "string", description: "Public URL to fetch" } }, required: ["url"], additionalProperties: false }),
-      execute: async ({ url }) => { try { return await browserMarkdown(this.env.BROWSER, { url }); } catch { return await browserContent(this.env.BROWSER, { url }); } }
+      inputSchema: jsonSchema<{ url: string }>({ type: "object", properties: { url: { type: "string", description: "Public URL to fetch" } }, required: ["url"], execute: async ({ url }) => { try { return await browserMarkdown(this.env.BROWSER, { url }); } catch { return await browserContent(this.env.BROWSER, { url }); } }
     });
     return { web_search: webSearchTool, fetch_to_markdown: fetchToMarkdown, browse, cf_web_fetch: cfWebFetch };
   }
