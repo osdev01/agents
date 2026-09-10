@@ -5,6 +5,7 @@ interface __BaseEnv_Env {
   BROWSER: import("agents/browser").QuickActionBinding;
   BAI_BASE_URL: string;
   BAI_API_KEY: string;
+  BAI_MODEL?: string;
   TELEGRAM_BOT_TOKEN: string;
   TELEGRAM_WEBHOOK_SECRET_TOKEN: string;
   TELEGRAM_BOT_USERNAME: string;
