@@ -1,3 +1,4 @@
+import { createOpenAI } from "@ai-sdk/openai";
 import { Think, type TurnContext, type TurnConfig } from "@cloudflare/think";
 import { browserContent, browserMarkdown } from "agents/browser";
 import { tool, jsonSchema, type ToolSet } from "ai";
@@ -79,7 +80,6 @@ async function officialCloudflareSearch(query: string): Promise<string | null> {
 
   const sources: string[] = [];
 
-  // npm is authoritative for the currently published SDK version.
   if (/(latest|version|نسخه|ورژن|release|released)/iu.test(query)) {
     try {
       const npm = JSON.parse(await fetchText("https://registry.npmjs.org/agents/latest", {
@@ -115,13 +115,10 @@ async function officialCloudflareSearch(query: string): Promise<string | null> {
 }
 
 async function webSearch(query: string): Promise<string> {
-  // For Cloudflare questions, prefer first-party sources instead of generic search noise.
   const official = await officialCloudflareSearch(query);
   if (official) return official;
 
   const errors: string[] = [];
-  // Do not use Browser Run for search. It has a strict Free-plan rate limit.
-  // Bing RSS is attempted first because it returns structured title/URL/snippet data.
   for (const [name, searcher] of [
     ["Bing RSS", searchWithBingRss],
     ["Jina", searchWithJina],
@@ -158,7 +155,11 @@ function extractExplicitSearchQuery(text: string): string | null {
 
 export class ConversationAgent extends Think {
   override getModel() {
-    return "@cf/zai-org/glm-4.7-flash";
+    const provider = createOpenAI({
+      apiKey: this.env.BAI_API_KEY,
+      baseURL: this.env.BAI_BASE_URL
+    });
+    return provider("deepseek-v4-flash");
   }
 
   override getSystemPrompt(): string {
@@ -168,7 +169,8 @@ export class ConversationAgent extends Think {
       "Use plain text or simple Markdown only.",
       "Do not expose hidden reasoning, tool calls, or internal state.",
       "",
-      "You have web search through ordinary Cloudflare Worker fetch() and Cloudflare Browser Run Quick Actions.",
+      "Your language model is provided by B.AI through an OpenAI-compatible API.",
+      "You have web search through ordinary Cloudflare Worker fetch().",
       "Use web_search for current information, web research, documentation, prices, news, software versions, errors, and verification.",
       "For Cloudflare questions, prefer the official Cloudflare changelog and official npm package data returned by web_search.",
       "Use fetch_to_markdown when you need the readable text of a URL.",
@@ -184,7 +186,7 @@ export class ConversationAgent extends Think {
 
   override getTools(): ToolSet {
     const webSearchTool = tool({
-      description: "Search the public web using ordinary HTTP from the Cloudflare Worker. For Cloudflare questions it prioritizes official Cloudflare and npm sources. It does not consume Browser Run.",
+      description: "Search the public web using ordinary HTTP from the Cloudflare Worker. For Cloudflare questions it prioritizes official Cloudflare and npm sources.",
       inputSchema: jsonSchema<{ query: string }>({
         type: "object",
         properties: { query: { type: "string", description: "Focused web search query" } },
