@@ -60,14 +60,38 @@ function parseDuckDuckGo(html: string): SearchResult[] {
   return results;
 }
 
-async function searchEngine(url: string): Promise<SearchResult[]> {
+function parseGoogle(html: string): SearchResult[] {
+  const results: SearchResult[] = [];
+  const pattern = /<a[^>]+href=["'](?:\/url\?q=|)(https?:\/\/[^"'&]+)[^"']*["'][^>]*>([\s\S]*?)<\/a>/gi;
+  let match: RegExpExecArray | null;
+
+  while ((match = pattern.exec(html)) && results.length < 5) {
+    const url = decodeHtml(match[1]);
+    const title = stripHtml(match[2]);
+    if (!/^https?:\/\//i.test(url) || !title) continue;
+    if (/google\.(?:com|de|co\.uk)\//i.test(url)) continue;
+    if (title.length < 3) continue;
+
+    const nearby = html.slice(match.index, match.index + 5000);
+    const text = stripHtml(nearby).slice(0, 500);
+    results.push({ title, url, snippet: text });
+  }
+
+  return results;
+}
+
+async function fetchSearchPage(url: string): Promise<string> {
   const response = await fetch(url, {
     headers: {
       "User-Agent": "Mozilla/5.0 (compatible; CloudflareAgent/1.0; +https://developers.cloudflare.com/workers/)"
     }
   });
   if (!response.ok) throw new Error(`Search engine returned HTTP ${response.status}`);
-  return parseDuckDuckGo(await response.text());
+  return response.text();
+}
+
+async function searchEngine(url: string, parser: (html: string) => SearchResult[]): Promise<SearchResult[]> {
+  return parser(await fetchSearchPage(url));
 }
 
 function extractPageText(html: string): string {
@@ -78,19 +102,35 @@ function extractPageText(html: string): string {
 }
 
 export async function searchWeb(query: string): Promise<string> {
-  let results: SearchResult[] = [];
-  let searchError = "";
+  const encodedQuery = encodeURIComponent(query);
+  const engines = [
+    {
+      name: "DuckDuckGo",
+      url: `https://html.duckduckgo.com/html/?q=${encodedQuery}`,
+      parser: parseDuckDuckGo
+    },
+    {
+      name: "Google",
+      url: `https://www.google.com/search?q=${encodedQuery}&num=5&hl=en&gbv=1`,
+      parser: parseGoogle
+    }
+  ];
 
-  try {
-    results = await searchEngine(
-      `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`
-    );
-  } catch (error) {
-    searchError = String(error);
+  let results: SearchResult[] = [];
+  const errors: string[] = [];
+
+  for (const engine of engines) {
+    try {
+      results = await searchEngine(engine.url, engine.parser);
+      if (results.length > 0) break;
+      errors.push(`${engine.name}: no parsed results`);
+    } catch (error) {
+      errors.push(`${engine.name}: ${String(error)}`);
+    }
   }
 
   if (results.length === 0) {
-    return `No web results were available for: ${query}${searchError ? ` (${searchError})` : ""}`;
+    return `No web results were available for: ${query}. Search attempts: ${errors.join(" | ")}`;
   }
 
   const pages = await Promise.all(
@@ -186,9 +226,6 @@ export class ConversationAgent extends Think {
   }
 
   override async beforeTurn(ctx: TurnContext): Promise<TurnConfig | void> {
-    // For an explicit search request, do the search before the model stream.
-    // This keeps the Telegram-visible stream text-only and prevents a second
-    // identical web_search tool call during the same turn.
     if (ctx.continuation) return;
 
     const latestUserMessage = [...ctx.messages].reverse().find((message) => {
@@ -202,7 +239,7 @@ export class ConversationAgent extends Think {
       system:
         `${ctx.system}\n\n` +
         `WEB SEARCH RESULTS FOR THIS TURN:\n${webResults}\n\n` +
-        `Use these results to answer the user's request. Do not call web_search again for this same request. Include relevant source URLs.` ,
+        `Use these results to answer the user's request. Do not call web_search again for this same request. Include relevant source URLs.`,
       activeTools: Object.keys(ctx.tools).filter((name) => name !== "web_search")
     };
   }
