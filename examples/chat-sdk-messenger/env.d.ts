@@ -3,7 +3,8 @@
 interface __BaseEnv_Env {
   AI: Ai;
   BROWSER: import("agents/browser").QuickActionBinding;
-  LOADER: WorkerLoader;
+  BAI_BASE_URL: string;
+  BAI_API_KEY: string;
   TELEGRAM_BOT_TOKEN: string;
   TELEGRAM_WEBHOOK_SECRET_TOKEN: string;
   TELEGRAM_BOT_USERNAME: string;
