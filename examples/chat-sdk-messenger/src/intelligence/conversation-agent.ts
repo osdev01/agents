@@ -41,9 +41,7 @@ async function fetchText(url: string, headers: HeadersInit = {}): Promise<string
 
 async function searchWithBingRss(query: string): Promise<string> {
   const url = `https://www.bing.com/search?format=rss&q=${encodeURIComponent(query)}`;
-  const xml = await fetchText(url, {
-    Accept: "application/rss+xml, application/xml, text/xml;q=0.9, */*;q=0.8"
-  });
+  const xml = await fetchText(url, { Accept: "application/rss+xml, application/xml, text/xml;q=0.9, */*;q=0.8" });
   const items: string[] = [];
   const itemPattern = /<item>([\s\S]*?)<\/item>/gi;
   let itemMatch: RegExpExecArray | null;
@@ -67,9 +65,7 @@ async function searchWithJina(query: string): Promise<string> {
 }
 
 async function searchWithYahoo(query: string): Promise<string> {
-  const html = await fetchText(`https://search.yahoo.com/search?p=${encodeURIComponent(query)}`, {
-    Accept: "text/html, */*;q=0.8"
-  });
+  const html = await fetchText(`https://search.yahoo.com/search?p=${encodeURIComponent(query)}`, { Accept: "text/html, */*;q=0.8" });
   const text = stripHtml(html);
   if (!text) throw new Error("Yahoo returned an empty response");
   return `WEB SEARCH RESULTS (Yahoo)\n\n${cleanText(text, 12000)}`;
@@ -77,58 +73,30 @@ async function searchWithYahoo(query: string): Promise<string> {
 
 async function officialCloudflareSearch(query: string): Promise<string | null> {
   if (!/(cloudflare|agents\s+sdk|cloudflare\s+agents)/iu.test(query)) return null;
-
   const sources: string[] = [];
-
   if (/(latest|version|نسخه|ورژن|release|released)/iu.test(query)) {
     try {
-      const npm = JSON.parse(await fetchText("https://registry.npmjs.org/agents/latest", {
-        Accept: "application/json"
-      })) as { name?: string; version?: string; homepage?: string };
-      if (npm.version) {
-        sources.push(`Official npm package: ${npm.name || "agents"}@${npm.version}\nURL: https://www.npmjs.com/package/agents\nPackage registry: https://registry.npmjs.org/agents/latest`);
-      }
-    } catch {
-      // Continue with Cloudflare's official changelog.
-    }
+      const npm = JSON.parse(await fetchText("https://registry.npmjs.org/agents/latest", { Accept: "application/json" })) as { name?: string; version?: string };
+      if (npm.version) sources.push(`Official npm package: ${npm.name || "agents"}@${npm.version}\nURL: https://www.npmjs.com/package/agents\nPackage registry: https://registry.npmjs.org/agents/latest`);
+    } catch {}
   }
-
   try {
-    const changelog = await fetchText("https://developers.cloudflare.com/changelog/product/agents/", {
-      Accept: "text/html, */*;q=0.8"
-    });
+    const changelog = await fetchText("https://developers.cloudflare.com/changelog/product/agents/", { Accept: "text/html, */*;q=0.8" });
     const text = stripHtml(changelog);
     const terms = query.toLowerCase().split(/\s+/).filter((x) => x.length > 3).slice(0, 8);
     const chunks = text.split(/(?=Agents SDK|Agents can|AgentsWorkers)/i);
-    const relevant = chunks
-      .filter((chunk) => terms.some((term) => chunk.toLowerCase().includes(term)))
-      .slice(0, 5)
-      .map((chunk) => cleanText(chunk, 3500));
-    if (relevant.length) {
-      sources.push(`Official Cloudflare Agents changelog:\nURL: https://developers.cloudflare.com/changelog/product/agents/\n${relevant.join("\n\n")}`);
-    }
-  } catch {
-    // General search below remains available.
-  }
-
+    const relevant = chunks.filter((chunk) => terms.some((term) => chunk.toLowerCase().includes(term))).slice(0, 5).map((chunk) => cleanText(chunk, 3500));
+    if (relevant.length) sources.push(`Official Cloudflare Agents changelog:\nURL: https://developers.cloudflare.com/changelog/product/agents/\n${relevant.join("\n\n")}`);
+  } catch {}
   return sources.length ? `OFFICIAL CLOUDFLARE RESULTS\n\n${sources.join("\n\n")}` : null;
 }
 
 async function webSearch(query: string): Promise<string> {
   const official = await officialCloudflareSearch(query);
   if (official) return official;
-
   const errors: string[] = [];
-  for (const [name, searcher] of [
-    ["Bing RSS", searchWithBingRss],
-    ["Jina", searchWithJina],
-    ["Yahoo", searchWithYahoo]
-  ] as const) {
-    try {
-      return await searcher(query);
-    } catch (error) {
-      errors.push(`${name}: ${String(error)}`);
-    }
+  for (const [name, searcher] of [["Bing RSS", searchWithBingRss], ["Jina", searchWithJina], ["Yahoo", searchWithYahoo]] as const) {
+    try { return await searcher(query); } catch (error) { errors.push(`${name}: ${String(error)}`); }
   }
   throw new Error(`No web results were available for: ${query}. ${errors.join(" | ")}`);
 }
@@ -147,19 +115,14 @@ function messageText(message: unknown): string {
 }
 
 function extractExplicitSearchQuery(text: string): string | null {
-  const match = text.match(
-    /(?:در\s+وب\s+جستجو\s+کن|در\s+اینترنت\s+جستجو\s+کن|وب\s+جستجو\s+کن|در\s+وب\s+سرچ\s+کن|سرچ\s+کن|جستجو\s+کن|search\s+the\s+web|search\s+online|search\s+the\s+internet)\s*:?[\s-]*(.+)$/iu
-  );
+  const match = text.match(/(?:در\s+وب\s+جستجو\s+کن|در\s+اینترنت\s+جستجو\s+کن|وب\s+جستجو\s+کن|در\s+وب\s+سرچ\s+کن|سرچ\s+کن|جستجو\s+کن|search\s+the\s+web|search\s+online|search\s+the\s+internet)\s*:?[\s-]*(.+)$/iu);
   return match?.[1]?.trim() || null;
 }
 
 export class ConversationAgent extends Think {
   override getModel() {
-    const provider = createOpenAI({
-      apiKey: this.env.BAI_API_KEY,
-      baseURL: this.env.BAI_BASE_URL
-    });
-    return provider("deepseek-v4-flash");
+    const provider = createOpenAI({ apiKey: this.env.BAI_API_KEY, baseURL: this.env.BAI_BASE_URL });
+    return provider("ling-3.0-flash-fin-free");
   }
 
   override getSystemPrompt(): string {
@@ -168,7 +131,6 @@ export class ConversationAgent extends Think {
       "Answer the user's latest message directly.",
       "Use plain text or simple Markdown only.",
       "Do not expose hidden reasoning, tool calls, or internal state.",
-      "",
       "Your language model is provided by B.AI through an OpenAI-compatible API.",
       "You have web search through ordinary Cloudflare Worker fetch().",
       "Use web_search for current information, web research, documentation, prices, news, software versions, errors, and verification.",
@@ -187,60 +149,25 @@ export class ConversationAgent extends Think {
   override getTools(): ToolSet {
     const webSearchTool = tool({
       description: "Search the public web using ordinary HTTP from the Cloudflare Worker. For Cloudflare questions it prioritizes official Cloudflare and npm sources.",
-      inputSchema: jsonSchema<{ query: string }>({
-        type: "object",
-        properties: { query: { type: "string", description: "Focused web search query" } },
-        required: ["query"],
-        additionalProperties: false
-      }),
+      inputSchema: jsonSchema<{ query: string }>({ type: "object", properties: { query: { type: "string", description: "Focused web search query" } }, required: ["query"], additionalProperties: false }),
       execute: async ({ query }) => webSearch(query)
     });
-
     const fetchToMarkdown = tool({
       description: "Fetch a public URL through Cloudflare Browser Run and return clean Markdown. Use this after search when you need to inspect a source page.",
-      inputSchema: jsonSchema<{ url: string }>({
-        type: "object",
-        properties: { url: { type: "string", description: "Public URL to fetch" } },
-        required: ["url"],
-        additionalProperties: false
-      }),
+      inputSchema: jsonSchema<{ url: string }>({ type: "object", properties: { url: { type: "string", description: "Public URL to fetch" } }, required: ["url"], additionalProperties: false }),
       execute: async ({ url }) => browserMarkdown(this.env.BROWSER, { url })
     });
-
     const browse = tool({
       description: "Open a public URL in Cloudflare Browser Run and return rendered HTML. Use only when page rendering or JavaScript is needed.",
-      inputSchema: jsonSchema<{ url: string }>({
-        type: "object",
-        properties: { url: { type: "string", description: "Public URL to browse" } },
-        required: ["url"],
-        additionalProperties: false
-      }),
+      inputSchema: jsonSchema<{ url: string }>({ type: "object", properties: { url: { type: "string", description: "Public URL to browse" } }, required: ["url"], additionalProperties: false }),
       execute: async ({ url }) => browserContent(this.env.BROWSER, { url })
     });
-
     const cfWebFetch = tool({
       description: "Fetch a public URL through Cloudflare Browser Run. Return Markdown when possible, otherwise rendered content.",
-      inputSchema: jsonSchema<{ url: string }>({
-        type: "object",
-        properties: { url: { type: "string", description: "Public URL to fetch" } },
-        required: ["url"],
-        additionalProperties: false
-      }),
-      execute: async ({ url }) => {
-        try {
-          return await browserMarkdown(this.env.BROWSER, { url });
-        } catch {
-          return await browserContent(this.env.BROWSER, { url });
-        }
-      }
+      inputSchema: jsonSchema<{ url: string }>({ type: "object", properties: { url: { type: "string", description: "Public URL to fetch" } }, required: ["url"], additionalProperties: false }),
+      execute: async ({ url }) => { try { return await browserMarkdown(this.env.BROWSER, { url }); } catch { return await browserContent(this.env.BROWSER, { url }); } }
     });
-
-    return {
-      web_search: webSearchTool,
-      fetch_to_markdown: fetchToMarkdown,
-      browse,
-      cf_web_fetch: cfWebFetch
-    };
+    return { web_search: webSearchTool, fetch_to_markdown: fetchToMarkdown, browse, cf_web_fetch: cfWebFetch };
   }
 
   override async beforeTurn(ctx: TurnContext): Promise<TurnConfig | void> {
@@ -248,15 +175,9 @@ export class ConversationAgent extends Think {
     const latestUserMessage = [...ctx.messages].reverse().find((message) => message.role === "user");
     const query = extractExplicitSearchQuery(messageText(latestUserMessage));
     if (!query) return;
-
     const webResults = await webSearch(query);
-    return {
-      system: `${ctx.system}\n\nWEB SEARCH RESULTS FOR THIS TURN:\n${webResults}\n\nUse these results to answer the user's request. Do not repeat the same search unless the results are insufficient.`,
-      activeTools: Object.keys(ctx.tools)
-    };
+    return { system: `${ctx.system}\n\nWEB SEARCH RESULTS FOR THIS TURN:\n${webResults}\n\nUse these results to answer the user's request. Do not repeat the same search unless the results are insufficient.`, activeTools: Object.keys(ctx.tools) };
   }
 
-  async resetConversation(): Promise<void> {
-    await this.clearMessages();
-  }
+  async resetConversation(): Promise<void> { await this.clearMessages(); }
 }
