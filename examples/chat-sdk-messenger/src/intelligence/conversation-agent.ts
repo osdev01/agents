@@ -77,8 +77,53 @@ function extractPageText(html: string): string {
   return stripHtml(main).slice(0, 8000);
 }
 
+export async function searchWeb(query: string): Promise<string> {
+  let results: SearchResult[] = [];
+  let searchError = "";
+
+  try {
+    results = await searchEngine(
+      `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`
+    );
+  } catch (error) {
+    searchError = String(error);
+  }
+
+  if (results.length === 0) {
+    return `No web results were available for: ${query}${searchError ? ` (${searchError})` : ""}`;
+  }
+
+  const pages = await Promise.all(
+    results.slice(0, 3).map(async (result) => {
+      try {
+        const page = await fetch(result.url, {
+          headers: {
+            "User-Agent": "Mozilla/5.0 (compatible; CloudflareAgent/1.0)"
+          },
+          redirect: "follow"
+        });
+        if (!page.ok) return { ...result, content: `HTTP ${page.status}` };
+        const contentType = page.headers.get("content-type") ?? "";
+        if (!contentType.includes("text/html")) {
+          return { ...result, content: `Non-HTML response: ${contentType}` };
+        }
+        return { ...result, content: extractPageText(await page.text()) };
+      } catch (error) {
+        return { ...result, content: `Could not fetch page: ${String(error)}` };
+      }
+    })
+  );
+
+  return pages
+    .map(
+      (page, index) =>
+        `${index + 1}. ${page.title}\nURL: ${page.url}\nSnippet: ${page.snippet}\nContent: ${page.content}`
+    )
+    .join("\n\n");
+}
+
 const webSearchTool = tool({
-  description: "Search the public web for current information and open the most relevant result pages. Use this whenever the user asks for web search, current information, research, documentation, or verification.",
+  description: "Search the public web for current information and open the most relevant result pages. Use this whenever the user asks for web search, current information, research, documentation, prices, news, software versions, errors, or verification.",
   inputSchema: jsonSchema<{ query: string }>({
     type: "object",
     properties: {
@@ -87,50 +132,7 @@ const webSearchTool = tool({
     required: ["query"],
     additionalProperties: false
   }),
-  execute: async ({ query }) => {
-    let results: SearchResult[] = [];
-    let searchError = "";
-
-    try {
-      results = await searchEngine(
-        `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`
-      );
-    } catch (error) {
-      searchError = String(error);
-    }
-
-    if (results.length === 0) {
-      return `No web results were available for: ${query}${searchError ? ` (${searchError})` : ""}`;
-    }
-
-    const pages = await Promise.all(
-      results.slice(0, 3).map(async (result) => {
-        try {
-          const page = await fetch(result.url, {
-            headers: {
-              "User-Agent": "Mozilla/5.0 (compatible; CloudflareAgent/1.0)"
-            },
-            redirect: "follow"
-          });
-          if (!page.ok) return { ...result, content: `HTTP ${page.status}` };
-          const contentType = page.headers.get("content-type") ?? "";
-          if (!contentType.includes("text/html")) {
-            return { ...result, content: `Non-HTML response: ${contentType}` };
-          }
-          return { ...result, content: extractPageText(await page.text()) };
-        } catch (error) {
-          return { ...result, content: `Could not fetch page: ${String(error)}` };
-        }
-      })
-    );
-
-    return pages
-      .map(
-        (page, index) =>
-          `${index + 1}. ${page.title}\nURL: ${page.url}\nSnippet: ${page.snippet}\nContent: ${page.content}`
-      )
-      .join("\n\n");
-  }
+  execute: async ({ query }) => searchWeb(query)
 });
 
 export class ConversationAgent extends Think {
@@ -145,28 +147,14 @@ export class ConversationAgent extends Think {
       "Use plain text or simple Markdown only.",
       "Do not expose hidden reasoning, tool calls, or internal state.",
       "",
-      "A server-side web_search tool is available to you.",
-      "For any request involving current information, web research, a website, documentation, prices, news, software versions, errors, or facts that may have changed, call web_search before answering.",
-      "If the user explicitly asks to search the web, you MUST call web_search.",
-      "Do not say that you lack internet access when web_search is available.",
-      "Do not claim that you searched unless the tool returned results.",
+      "A server-side web_search tool is available to you for non-Telegram contexts.",
+      "For requests involving current information, web research, documentation, prices, news, software versions, errors, or facts that may have changed, use web_search when tool calling is supported.",
+      "If web search results are provided in the user message, treat them as research context and answer from them.",
+      "Do not say that you lack internet access when web search results are available.",
+      "Do not claim that you searched unless search results were actually provided or returned by the tool.",
       "Prefer official and primary sources for technical questions.",
       "After searching, summarize the relevant findings and include the source URLs."
     ].join("\n");
-  }
-
-  override beforeTurn(ctx: { messages: Array<{ role?: string; content?: unknown }> }) {
-    const lastMessage = ctx.messages[ctx.messages.length - 1];
-    const text = lastMessage?.content == null ? "" : JSON.stringify(lastMessage.content);
-    const explicitSearch = /(?:در\s+وب|در\s+اینترنت|وب\s+جستجو|جستجو\s+کن|سرچ\s+کن|روی\s+وب|search\s+the\s+web|web\s+search|search\s+online|look\s+it\s+up|browse\s+the\s+web)/i.test(text);
-
-    if (explicitSearch) {
-      return {
-        activeTools: ["web_search"],
-        toolChoice: { type: "tool", toolName: "web_search" },
-        maxSteps: 4
-      };
-    }
   }
 
   override getTools(): ToolSet {
