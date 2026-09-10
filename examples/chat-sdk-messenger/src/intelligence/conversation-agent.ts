@@ -155,6 +155,20 @@ export class ConversationAgent extends Think {
     ].join("\n");
   }
 
+  override beforeTurn(ctx: { messages: Array<{ role?: string; content?: unknown }> }) {
+    const lastMessage = ctx.messages[ctx.messages.length - 1];
+    const text = typeof lastMessage?.content === "string" ? lastMessage.content : "";
+    const explicitSearch = /(?:در\s+وب|در\s+اینترنت|وب\s+جستجو|جستجو\s+کن|سرچ\s+کن|روی\s+وب|search\s+the\s+web|web\s+search|search\s+online|look\s+it\s+up|browse\s+the\s+web)/i.test(text);
+
+    if (explicitSearch) {
+      return {
+        activeTools: ["web_search"],
+        toolChoice: { type: "tool", toolName: "web_search" },
+        maxSteps: 4
+      };
+    }
+  }
+
   override getTools(): ToolSet {
     return { web_search: webSearchTool };
   }
