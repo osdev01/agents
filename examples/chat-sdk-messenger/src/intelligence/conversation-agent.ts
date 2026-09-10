@@ -1,7 +1,8 @@
 import { Think, type TurnContext, type TurnConfig } from "@cloudflare/think";
-import { createBrowserTools } from "@cloudflare/think/tools/browser";
 import { browserContent, browserMarkdown } from "agents/browser";
 import { tool, jsonSchema, type ToolSet } from "ai";
+
+type Browser = Env["BROWSER"];
 
 function cleanText(value: string, max = 12000): string {
   return value.replace(/\s+/g, " ").trim().slice(0, max);
@@ -27,12 +28,10 @@ function extractLinks(html: string): { title: string; url: string }[] {
   return results;
 }
 
-async function readSearchResults(browser: Env["BROWSER"], searchUrl: string, engine: string): Promise<string> {
+async function readSearchResults(browser: Browser, searchUrl: string, engine: string): Promise<string> {
   const html = await browserContent(browser, { url: searchUrl });
   const links = extractLinks(html);
-  if (links.length === 0) {
-    throw new Error(`${engine}: no search results extracted`);
-  }
+  if (links.length === 0) throw new Error(`${engine}: no search results extracted`);
 
   const pages = await Promise.all(
     links.slice(0, 5).map(async (result, index) => {
@@ -48,16 +47,10 @@ async function readSearchResults(browser: Env["BROWSER"], searchUrl: string, eng
   return pages.join("\n\n");
 }
 
-async function browserWebSearch(browser: Env["BROWSER"], query: string): Promise<string> {
+async function browserWebSearch(browser: Browser, query: string): Promise<string> {
   const engines = [
-    {
-      name: "Google",
-      url: `https://www.google.com/search?q=${encodeURIComponent(query)}&num=8&hl=en&gbv=1`
-    },
-    {
-      name: "Bing",
-      url: `https://www.bing.com/search?q=${encodeURIComponent(query)}&count=8`
-    }
+    { name: "Google", url: `https://www.google.com/search?q=${encodeURIComponent(query)}&num=8&hl=en&gbv=1` },
+    { name: "Bing", url: `https://www.bing.com/search?q=${encodeURIComponent(query)}&count=8` }
   ];
   const errors: string[] = [];
 
@@ -69,7 +62,7 @@ async function browserWebSearch(browser: Env["BROWSER"], query: string): Promise
     }
   }
 
-  return `No web results were available for: ${query}\nSearch attempts: ${errors.join(" | ")}`;
+  throw new Error(`No web results were available for: ${query}. ${errors.join(" | ")}`);
 }
 
 function messageText(message: unknown): string {
@@ -78,15 +71,11 @@ function messageText(message: unknown): string {
   if (candidate.role !== "user") return "";
   if (typeof candidate.content === "string") return candidate.content;
   if (!Array.isArray(candidate.content)) return "";
-
-  return candidate.content
-    .map((part) => {
-      if (!part || typeof part !== "object") return "";
-      const text = (part as { text?: unknown }).text;
-      return typeof text === "string" ? text : "";
-    })
-    .filter(Boolean)
-    .join("\n");
+  return candidate.content.map((part) => {
+    if (!part || typeof part !== "object") return "";
+    const text = (part as { text?: unknown }).text;
+    return typeof text === "string" ? text : "";
+  }).filter(Boolean).join("\n");
 }
 
 function extractExplicitSearchQuery(text: string): string | null {
@@ -108,12 +97,12 @@ export class ConversationAgent extends Think {
       "Use plain text or simple Markdown only.",
       "Do not expose hidden reasoning, tool calls, or internal state.",
       "",
-      "You have Cloudflare Browser Run tools for web research.",
+      "You have Cloudflare Browser Run Quick Actions for web research.",
       "Use web_search for current information, web research, documentation, prices, news, software versions, errors, and verification.",
       "Use fetch_to_markdown when you need the readable text of a URL.",
       "Use browse when you need rendered HTML or page structure after JavaScript execution.",
-      "Use cf_web_fetch when you need a Cloudflare-hosted web fetch and prefer it over a normal fetch.",
-      "Use browser_execute for interactive browser automation when a simple fetch is not enough.",
+      "Use cf_web_fetch when you need a Cloudflare-hosted web fetch.",
+      "Interactive browser_execute is intentionally not enabled because it requires Worker Loader/Dynamic Workers on the paid plan.",
       "Prefer official and primary sources for technical questions.",
       "Never claim that you cannot access the web when these tools are available.",
       "After research, summarize the findings and include relevant source URLs."
@@ -121,15 +110,8 @@ export class ConversationAgent extends Think {
   }
 
   override getTools(): ToolSet {
-    const browserTools = createBrowserTools({
-      ctx: this.ctx,
-      browser: this.env.BROWSER,
-      loader: this.env.LOADER,
-      quickActions: { maxChars: 12000 }
-    });
-
     const webSearch = tool({
-      description: "Search Google and Bing through Cloudflare Browser Run, then read the most relevant result pages. Use for current web research and verification.",
+      description: "Search Google and Bing through Cloudflare Browser Run Quick Actions, then read the most relevant result pages.",
       inputSchema: jsonSchema<{ query: string }>({
         type: "object",
         properties: { query: { type: "string", description: "Focused web search query" } },
@@ -140,7 +122,7 @@ export class ConversationAgent extends Think {
     });
 
     const fetchToMarkdown = tool({
-      description: "Fetch a public URL through Cloudflare Browser Run and return clean Markdown. Best for documentation, articles, and readable page content.",
+      description: "Fetch a public URL through Cloudflare Browser Run and return clean Markdown.",
       inputSchema: jsonSchema<{ url: string }>({
         type: "object",
         properties: { url: { type: "string", description: "Public URL to fetch" } },
@@ -151,7 +133,7 @@ export class ConversationAgent extends Think {
     });
 
     const browse = tool({
-      description: "Open a public URL in Cloudflare Browser Run and return rendered HTML. Use when JavaScript-generated page content or structure matters.",
+      description: "Open a public URL in Cloudflare Browser Run and return rendered HTML.",
       inputSchema: jsonSchema<{ url: string }>({
         type: "object",
         properties: { url: { type: "string", description: "Public URL to browse" } },
@@ -162,7 +144,7 @@ export class ConversationAgent extends Think {
     });
 
     const cfWebFetch = tool({
-      description: "Fetch a public URL through Cloudflare Browser Run. Prefer this over direct fetch when web content should be observable and rendered by Cloudflare.",
+      description: "Fetch a public URL through Cloudflare Browser Run. Return Markdown when possible, otherwise rendered content.",
       inputSchema: jsonSchema<{ url: string }>({
         type: "object",
         properties: { url: { type: "string", description: "Public URL to fetch" } },
@@ -179,7 +161,6 @@ export class ConversationAgent extends Think {
     });
 
     return {
-      ...browserTools,
       web_search: webSearch,
       fetch_to_markdown: fetchToMarkdown,
       browse,
@@ -189,16 +170,13 @@ export class ConversationAgent extends Think {
 
   override async beforeTurn(ctx: TurnContext): Promise<TurnConfig | void> {
     if (ctx.continuation) return;
-
     const latestUserMessage = [...ctx.messages].reverse().find((message) => message.role === "user");
     const query = extractExplicitSearchQuery(messageText(latestUserMessage));
     if (!query) return;
 
     const webResults = await browserWebSearch(this.env.BROWSER, query);
     return {
-      system:
-        `${ctx.system}\n\nWEB RESEARCH RESULTS FOR THIS TURN:\n${webResults}\n\n` +
-        "Use these results to answer the user's request. Do not repeat the same search.",
+      system: `${ctx.system}\n\nWEB RESEARCH RESULTS FOR THIS TURN:\n${webResults}\n\nUse these results to answer the user's request. Do not repeat the same search.`,
       activeTools: Object.keys(ctx.tools).filter((name) => name !== "web_search")
     };
   }
