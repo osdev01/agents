@@ -61,6 +61,7 @@ import { WEBHOOK_PATH, setupTelegramWebhook } from "./provider/telegram";
 
 export { ConversationAgent } from "./intelligence/conversation-agent";
 export { ThinkMessengerStateAgent };
+export { CodemodeRuntime } from "@cloudflare/codemode";
 
 export type {
   AdminConversation,
@@ -532,99 +533,45 @@ export class ChatIngressAgent extends Agent {
     const snapshot = parseAiReplySnapshot(result.snapshot);
     if (snapshot) {
       await this.recoverAiReply(snapshot);
-      await this.resolveFiber(result.fiberId, { status: "completed" });
+      await this.resolveFiber(result.fiberId);
     }
   }
 
   private async resetConversation(thread: Thread): Promise<void> {
-    const agent = await this.getConversationAgent(thread);
-    await agent.resetConversation();
-    await thread.post("I've reset this conversation.");
+    const conversation = this.readConversation(thread.id);
+    if (!conversation) {
+      await thread.post("No conversation history found.");
+      return;
+    }
+
+    await (
+      await this.subAgent(ConversationAgent, conversation.conversationName)
+    ).resetConversation();
+    this.sql`
+      DELETE FROM chat_admin_conversations
+      WHERE thread_id = ${thread.id}
+    `;
+    await thread.post("Conversation history reset.");
   }
 
-  private getConversationAgent(
+  private async getConversationAgent(
     thread: Thread
   ): Promise<SubAgentStub<ConversationAgent>> {
-    return this.subAgent(ConversationAgent, conversationNameForThread(thread));
-  }
-
-  private shardThread(threadId: string): string {
-    return threadId.split(":").slice(0, 2).join(":");
+    const conversation = this.readConversation(thread.id);
+    if (!conversation) {
+      throw new Error(`Conversation not registered for thread ${thread.id}`);
+    }
+    return this.subAgent(ConversationAgent, conversation.conversationName);
   }
 
   private shouldUseAi(message: Message, thread: Thread): boolean {
-    return shouldRouteToAi({
-      isDM: thread.isDM,
-      isMention: message.isMention,
-      text: message.text
-    });
+    return shouldRouteToAi(message, thread);
   }
-}
-
-function setupResponse(request: Request, env: Cloudflare.Env): Response {
-  const url = new URL(request.url);
-  const webhookUrl = `${url.origin}${WEBHOOK_PATH}`;
-  const secretLine = `    "secret_token": "$TELEGRAM_WEBHOOK_SECRET_TOKEN"`;
-
-  return new Response(
-    [
-      "Chat SDK messenger ingress Agent",
-      "",
-      `Webhook endpoint: ${webhookUrl}`,
-      "",
-      "Set the Telegram webhook with:",
-      "",
-      `curl -X POST "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/setWebhook" \\`,
-      `  -H "Content-Type: application/json" \\`,
-      `  -d '{`,
-      `    "url": "${webhookUrl}",`,
-      secretLine,
-      `  }'`,
-      "",
-      env.TELEGRAM_BOT_TOKEN
-        ? "TELEGRAM_BOT_TOKEN is configured."
-        : "TELEGRAM_BOT_TOKEN is not configured."
-    ].join("\n"),
-    {
-      headers: {
-        "content-type": "text/plain; charset=utf-8"
-      }
-    }
-  );
 }
 
 export default {
-  async fetch(
-    request: Request,
-    env: Cloudflare.Env,
-    _ctx: ExecutionContext
-  ): Promise<Response> {
-    const url = new URL(request.url);
+  fetch: routeAgentRequest
+};
 
-    if (request.method === "GET" && url.pathname === "/") {
-      return setupResponse(request, env);
-    }
-
-    if (
-      request.method === "POST" &&
-      url.pathname === "/setup/telegram-webhook"
-    ) {
-      return setupTelegramWebhook(request, env);
-    }
-
-    if (request.method === "POST" && url.pathname === WEBHOOK_PATH) {
-      const agent = await getAgentByName(
-        env.ChatIngressAgent,
-        getIngressAgentName(request)
-      );
-      return agent.fetch(request);
-    }
-
-    const agentResponse = await routeAgentRequest(request, env);
-    if (agentResponse) {
-      return agentResponse;
-    }
-
-    return new Response("Not found", { status: 404 });
-  }
-} satisfies ExportedHandler<Cloudflare.Env>;
+void getAgentByName;
+void setupTelegramWebhook;
