@@ -39,16 +39,22 @@ export function shouldRouteToAi(input: AiRoutingInput): boolean {
   return input.isMention === true || isAskCommand(input.text);
 }
 
-export function toThinkUserMessage(message: Message): UIMessage {
+export function toThinkUserMessage(
+  message: Message,
+  webContext?: string
+): UIMessage {
   const text = stripAskCommand(message.text).trim() || message.text.trim();
   const authorName =
     message.author.fullName || message.author.userName || message.author.userId;
   const content = authorName ? `${authorName}: ${text}` : text;
+  const finalText = webContext
+    ? `${content}\n\nWEB SEARCH RESULTS:\n${webContext}`
+    : content;
 
   return {
     id: `telegram:${message.id}`,
     role: "user",
-    parts: [{ type: "text", text: content }]
+    parts: [{ type: "text", text: finalText }]
   };
 }
 
