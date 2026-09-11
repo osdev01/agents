@@ -3,6 +3,15 @@ import { Think, type TurnContext, type TurnConfig } from "@cloudflare/think";
 import { browserContent, browserMarkdown } from "agents/browser";
 import { tool, jsonSchema, type ToolSet } from "ai";
 
+export type SearchMode =
+  | "auto"
+  | "tavily_search"
+  | "tavily_research"
+  | "web_search"
+  | "fetch_to_markdown"
+  | "none";
+
+type SearchState = { searchMode: SearchMode };
 type SearchDepth = "basic" | "advanced";
 type SearchTopic = "general" | "news" | "finance";
 type ResearchModel = "auto" | "mini" | "pro";
@@ -17,23 +26,8 @@ type TavilySearchResult = {
 
 type TavilyUsage = { credits?: number };
 
-type TavilyReport = {
-  type: string;
-  depth?: SearchDepth;
-  model?: ResearchModel;
-  requestId?: string;
-  creditsUsed?: number;
-  resultCount?: number;
-  sourceCount?: number;
-  sources: Array<{ title?: string; url?: string }>;
-};
-
 function cleanText(value: string, max = 12000): string {
   return value.replace(/\s+/g, " ").trim().slice(0, max);
-}
-
-function isCurrentOrRecommendationQuery(query: string): boolean {
-  return /(latest|newest|current|today|now|2026|best|top|recommended|recommendation|comparison|compare|آخرین|جدیدترین|جدید|امروز|الان|بهترین|برتر|پیشنهاد|مقایسه)/iu.test(query);
 }
 
 function getTavilyApiKey(env: Env): string {
@@ -42,9 +36,13 @@ function getTavilyApiKey(env: Env): string {
   return apiKey;
 }
 
-async function tavilyRequest<T>(env: Env, path: string, body?: unknown, method: "GET" | "POST" = "POST"): Promise<T> {
+async function tavilyRequest<T>(
+  env: Env,
+  path: string,
+  body?: unknown,
+  method: "GET" | "POST" = "POST"
+): Promise<T> {
   console.log("[TAVILY] request", { path, method });
-
   const response = await fetch(`https://api.tavily.com${path}`, {
     method,
     headers: {
@@ -75,47 +73,20 @@ async function tavilyRequest<T>(env: Env, path: string, body?: unknown, method: 
   return parsed;
 }
 
-function formatWebSearchReport(input: TavilyReport): string {
-  const sources = input.sources.filter((source) => source.url).slice(0, 8);
-  return [
-    "━━━━━━━━━━━━━━",
-    "🔎 گزارش جستجوی واقعی Tavily",
-    `نوع جستجو: ${input.type}`,
-    "Provider: Tavily",
-    input.depth ? `عمق جستجو: ${input.depth === "advanced" ? "Advanced" : "Basic"}` : "",
-    input.model ? `مدل تحقیق: ${input.model}` : "",
-    input.requestId ? `Request ID واقعی Tavily: ${input.requestId}` : "Request ID: دریافت نشد",
-    input.creditsUsed !== undefined ? `Credits مصرف‌شده طبق پاسخ Tavily: ${input.creditsUsed}` : "Credits: در پاسخ Tavily گزارش نشد",
-    input.resultCount !== undefined ? `تعداد نتایج: ${input.resultCount}` : "",
-    input.sourceCount !== undefined ? `تعداد منابع: ${input.sourceCount}` : "",
-    sources.length ? "منابع واقعی برگشتی از Tavily:" : "منبع URL قابل نمایش دریافت نشد",
-    ...sources.map((source, index) => `${index + 1}. ${source.title || "Source"}\n${source.url}`),
-    "━━━━━━━━━━━━━━"
-  ].filter(Boolean).join("\n");
-}
-
-function formatSearchResults(query: string, response: {
-  results?: TavilySearchResult[];
-  request_id?: string;
-  usage?: TavilyUsage;
-}, depth: SearchDepth): { context: string; report: string } {
+function formatSearchContext(
+  query: string,
+  response: { results?: TavilySearchResult[]; request_id?: string; usage?: TavilyUsage },
+  depth: SearchDepth
+): string {
   const results = response.results ?? [];
-  const report = formatWebSearchReport({
-    type: "Web Search",
-    depth,
-    requestId: response.request_id,
-    creditsUsed: response.usage?.credits,
-    resultCount: results.length,
-    sourceCount: results.length,
-    sources: results.map((result) => ({ title: result.title, url: result.url }))
-  });
-
-  const context = [
+  return [
     "TAVILY SEARCH RESULT",
     `QUERY: ${query}`,
     `SEARCH DEPTH: ${depth}`,
     response.request_id ? `REQUEST ID: ${response.request_id}` : "REQUEST ID: MISSING",
-    response.usage?.credits !== undefined ? `TAVILY CREDITS USED: ${response.usage.credits}` : "TAVILY CREDITS USED: MISSING",
+    response.usage?.credits !== undefined
+      ? `TAVILY CREDITS USED: ${response.usage.credits}`
+      : "TAVILY CREDITS USED: MISSING",
     `RESULT COUNT: ${results.length}`,
     "",
     ...results.map((result, index) => [
@@ -125,16 +96,14 @@ function formatSearchResults(query: string, response: {
       result.content ? `CONTENT: ${cleanText(result.content, 6000)}` : ""
     ].filter(Boolean).join("\n"))
   ].filter(Boolean).join("\n\n");
-
-  return { context, report };
 }
 
 async function tavilySearch(
   env: Env,
   query: string,
   options: { depth?: SearchDepth; topic?: SearchTopic; maxResults?: number } = {}
-): Promise<{ context: string; report: string }> {
-  const depth = options.depth ?? (isCurrentOrRecommendationQuery(query) ? "advanced" : "basic");
+): Promise<string> {
+  const depth = options.depth ?? "advanced";
   const maxResults = Math.min(Math.max(options.maxResults ?? 6, 1), 10);
   const response = await tavilyRequest<{
     results?: TavilySearchResult[];
@@ -149,49 +118,14 @@ async function tavilySearch(
     include_raw_content: false,
     ...(depth === "advanced" ? { chunks_per_source: 2 } : {})
   });
-  return formatSearchResults(query, response, depth);
+  return formatSearchContext(query, response, depth);
 }
 
-function researchContentText(content: unknown): string {
-  if (typeof content === "string") return cleanText(content, 24000);
-  if (content && typeof content === "object") return JSON.stringify(content, null, 2).slice(0, 24000);
-  return "No research report was returned.";
-}
-
-function formatResearchResult(query: string, model: ResearchModel, result: {
-  status?: string;
-  content?: unknown;
-  sources?: Array<{ title?: string; url?: string; snippet?: string }>;
-  request_id?: string;
-}): { context: string; report: string } {
-  const sources = result.sources ?? [];
-  const report = formatWebSearchReport({
-    type: "Deep Research",
-    model,
-    requestId: result.request_id,
-    sourceCount: sources.length,
-    sources: sources.map((source) => ({ title: source.title, url: source.url }))
-  });
-  const context = [
-    "TAVILY DEEP RESEARCH REPORT",
-    `QUERY: ${query}`,
-    `MODEL: ${model}`,
-    `STATUS: ${result.status || "completed"}`,
-    result.request_id ? `REQUEST ID: ${result.request_id}` : "REQUEST ID: MISSING",
-    `SOURCE COUNT: ${sources.length}`,
-    "",
-    "RESEARCH REPORT",
-    researchContentText(result.content),
-    "",
-    "SOURCES",
-    ...sources.slice(0, 20).map((source, index) => `${index + 1}. ${source.title || source.url || "Source"}\nURL: ${source.url || ""}`),
-    "",
-    "Do not invent current facts, URLs, dates, rankings, or source metadata not present in this report."
-  ].filter(Boolean).join("\n\n");
-  return { context, report };
-}
-
-async function tavilyResearch(env: Env, query: string, model: ResearchModel = "mini"): Promise<{ context: string; report: string }> {
+async function tavilyResearch(
+  env: Env,
+  query: string,
+  model: ResearchModel = "mini"
+): Promise<string> {
   const response = await tavilyRequest<{ request_id?: string }>(env, "/research", {
     input: query,
     model,
@@ -207,214 +141,283 @@ async function tavilyResearch(env: Env, query: string, model: ResearchModel = "m
     }
   });
 
-  const requestId = response.request_id;
-  if (!requestId) throw new Error("Tavily Research did not return a request ID");
+  if (!response.request_id) {
+    throw new Error("Tavily Research did not return a request ID");
+  }
 
-  for (let attempt = 0; attempt < 40; attempt++) {
+  for (let attempt = 0; attempt < 40; attempt += 1) {
     const result = await tavilyRequest<{
       status?: string;
       content?: unknown;
       sources?: Array<{ title?: string; url?: string; snippet?: string }>;
       request_id?: string;
-    }>(env, `/research/${encodeURIComponent(requestId)}`, undefined, "GET");
+    }>(env, `/research/${encodeURIComponent(response.request_id)}`, undefined, "GET");
     const status = String(result.status || "").toLowerCase();
+
     if (status === "completed" || status === "complete") {
-      return formatResearchResult(query, model, result);
+      const sources = result.sources ?? [];
+      return [
+        "TAVILY DEEP RESEARCH RESULT",
+        `QUERY: ${query}`,
+        `MODEL: ${model}`,
+        `STATUS: ${result.status || "completed"}`,
+        `REQUEST ID: ${result.request_id || response.request_id}`,
+        `SOURCE COUNT: ${sources.length}`,
+        "",
+        "RESEARCH REPORT",
+        typeof result.content === "string"
+          ? result.content.slice(0, 24000)
+          : JSON.stringify(result.content ?? {}, null, 2).slice(0, 24000),
+        "",
+        "SOURCES",
+        ...sources.slice(0, 20).map(
+          (source, index) => `${index + 1}. ${source.title || source.url || "Source"}\nURL: ${source.url || ""}`
+        ),
+        "",
+        "Use only facts and source metadata present in this report."
+      ].join("\n\n");
     }
+
     if (status === "failed" || status === "error") {
       throw new Error(`Tavily Research failed with status: ${status}`);
     }
+
     await new Promise((resolve) => setTimeout(resolve, 1500));
   }
 
-  throw new Error("Tavily Research timed out while waiting for the research report");
+  throw new Error("Tavily Research timed out");
 }
 
-async function tavilyExtract(env: Env, urls: string[]): Promise<{ context: string; report: string }> {
+async function tavilyExtract(env: Env, urls: string[]): Promise<string> {
   const limitedUrls = urls.filter((url) => /^https?:\/\//i.test(url)).slice(0, 20);
   if (!limitedUrls.length) throw new Error("Provide at least one valid HTTP(S) URL");
+
   const response = await tavilyRequest<{
     results?: Array<{ url?: string; raw_content?: string }>;
     failed_results?: Array<{ url?: string; error?: string }>;
     usage?: TavilyUsage;
   }>(env, "/extract", { urls: limitedUrls });
+
   const successful = response.results ?? [];
   const failed = response.failed_results ?? [];
-  const report = formatWebSearchReport({
-    type: "URL Extraction",
-    requestId: undefined,
-    creditsUsed: response.usage?.credits,
-    sourceCount: successful.length,
-    sources: successful.map((item) => ({ title: "Extracted page", url: item.url }))
-  });
-  const context = [
+  return [
     "TAVILY EXTRACT RESULT",
     `REQUESTED URLS: ${limitedUrls.length}`,
     `SUCCESSFUL: ${successful.length}`,
     `FAILED: ${failed.length}`,
     response.usage?.credits !== undefined ? `TAVILY CREDITS USED: ${response.usage.credits}` : "",
     "",
-    ...successful.map((item, index) => `${index + 1}. URL: ${item.url || ""}\nCONTENT:\n${cleanText(item.raw_content || "", 10000)}`),
-    failed.length ? `FAILED URLS:\n${failed.map((item) => `${item.url || "unknown"}: ${item.error || "unknown error"}`).join("\n")}` : ""
+    ...successful.map(
+      (item, index) => `${index + 1}. URL: ${item.url || ""}\nCONTENT:\n${cleanText(item.raw_content || "", 10000)}`
+    ),
+    failed.length
+      ? `FAILED URLS:\n${failed.map((item) => `${item.url || "unknown"}: ${item.error || "unknown error"}`).join("\n")}`
+      : ""
   ].filter(Boolean).join("\n\n");
-  return { context, report };
 }
 
-function extractUserTextFromTurn(turn: unknown): string {
-  if (!turn || typeof turn !== "object") return "";
+async function webSearch(env: Env, query: string): Promise<string> {
+  const searchUrl = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`;
+  console.log("[WEB SEARCH] request", { query: cleanText(query, 300) });
+  const content = await browserMarkdown(env.BROWSER, searchUrl);
+  console.log("[WEB SEARCH] response", { length: content.length });
+  return [
+    "WEB SEARCH RESULT",
+    `QUERY: ${query}`,
+    `SEARCH URL: ${searchUrl}`,
+    "",
+    content.slice(0, 30000),
+    "",
+    "Treat this as live web-search output. Do not invent details that are not present in the result."
+  ].join("\n");
+}
 
-  const value = turn as {
-    message?: unknown;
-    messages?: unknown;
-    input?: unknown;
-  };
+async function fetchToMarkdown(env: Env, url: string): Promise<string> {
+  console.log("[FETCH MARKDOWN] request", { url: cleanText(url, 500) });
+  const content = await browserMarkdown(env.BROWSER, url);
+  console.log("[FETCH MARKDOWN] response", { url, length: content.length });
+  return [
+    "FETCH_TO_MARKDOWN RESULT",
+    `URL: ${url}`,
+    "",
+    content.slice(0, 30000)
+  ].join("\n");
+}
 
-  const candidates = [
-    value.message,
-    value.input,
-    Array.isArray(value.messages) ? value.messages[value.messages.length - 1] : undefined
-  ];
+function extractLatestUserText(messages: unknown): string {
+  if (!Array.isArray(messages)) return "";
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index] as { role?: unknown; content?: unknown };
+    if (message.role !== "user") continue;
 
-  for (const candidate of candidates) {
-    if (typeof candidate === "string" && candidate.trim()) return candidate.trim();
-
-    if (candidate && typeof candidate === "object") {
-      const item = candidate as { content?: unknown; parts?: unknown; text?: unknown };
-
-      if (typeof item.content === "string" && item.content.trim()) return item.content.trim();
-      if (typeof item.text === "string" && item.text.trim()) return item.text.trim();
-
-      if (Array.isArray(item.parts)) {
-        const text = item.parts
-          .map((part) => {
-            if (!part || typeof part !== "object") return "";
-            const partText = (part as { text?: unknown }).text;
-            return typeof partText === "string" ? partText : "";
-          })
-          .filter(Boolean)
-          .join("\n")
-          .trim();
-        if (text) return text;
-      }
+    if (typeof message.content === "string") return message.content.trim();
+    if (Array.isArray(message.content)) {
+      const text = message.content
+        .map((part) => {
+          if (!part || typeof part !== "object") return "";
+          const value = (part as { text?: unknown }).text;
+          return typeof value === "string" ? value : "";
+        })
+        .filter(Boolean)
+        .join("\n")
+        .trim();
+      if (text) return text;
     }
   }
-
   return "";
 }
 
-function shouldUseGuaranteedWebSearch(query: string): boolean {
-  return /(search|web|internet|online|look up|find information|latest|newest|current|today|now|news|price|pricing|cost|version|release|compare|comparison|best|top|recommend|recommendation|review|2026|جستجو|وب|اینترنت|آخرین|جدیدترین|جدید|امروز|الان|خبر|قیمت|نسخه|انتشار|مقایسه|بهترین|برترین|پیشنهاد|بررسی)/iu.test(query);
+function detectExplicitSearchMode(query: string): SearchMode | null {
+  if (/(بدون\s+(جستجو|سرچ|وب)|don't\s+search|do\s+not\s+search|no\s+web\s+search)/iu.test(query)) {
+    return "none";
+  }
+  if (/(tavily\s*(research|deep\s*research)|تحقیق\s+با\s+tavily|tavily.*تحقیق)/iu.test(query)) {
+    return "tavily_research";
+  }
+  if (/(tavily|تاویلی)/iu.test(query)) {
+    return "tavily_search";
+  }
+  if (/(fetch[_\s-]*to[_\s-]*markdown|fetch\s+markdown|دریافت\s+مارک.?دان|صفحه.*مارک.?دان)/iu.test(query)) {
+    return "fetch_to_markdown";
+  }
+  if (/(web[_\s-]*search|جستجوی?\s+وب|جستجو\s+در\s+وب|web\s+search)/iu.test(query)) {
+    return "web_search";
+  }
+  return null;
 }
 
-export class ConversationAgent extends Think {
-  private guaranteedWebContext: string | null = null;
+function looksLikeWebRequest(query: string): boolean {
+  return /https?:\/\//i.test(query) || /(search|web|internet|online|look up|latest|newest|current|today|now|news|price|pricing|cost|version|release|compare|comparison|best|top|recommend|recommendation|review|2026|جستجو|وب|اینترنت|آخرین|جدیدترین|امروز|الان|خبر|قیمت|نسخه|انتشار|مقایسه|بهترین|برترین|پیشنهاد|بررسی)/iu.test(query);
+}
+
+function chooseAutoSearchMode(query: string): SearchMode {
+  if (/https?:\/\//i.test(query) && /(fetch|read|open|page|url|صفحه|لینک|بخوان|بررسی)/iu.test(query)) {
+    return "fetch_to_markdown";
+  }
+  if (/(deep|research|investigate|comprehensive|fact.?check|تحقیق|بررسی\s+جامع|مقایسه\s+کامل)/iu.test(query)) {
+    return "tavily_research";
+  }
+  if (/(news|خبر|price|قیمت|finance|مالی|stock|سهام|crypto|ارز|latest|current|آخرین|امروز|الان)/iu.test(query)) {
+    return "tavily_search";
+  }
+  return "web_search";
+}
+
+function searchResultLooksUseful(result: string): boolean {
+  const normalized = result.trim().toLowerCase();
+  if (normalized.length < 500) return false;
+  if (/no results|failed|error|not found|نتیجه.?ای پیدا نشد/iu.test(normalized)) return false;
+  return /https?:\/\//i.test(result) || /result|نتیجه|source|منبع|content|محتوا/i.test(result);
+}
+
+export class ConversationAgent extends Think<Env, SearchState> {
+  initialState: SearchState = { searchMode: "auto" };
 
   override getModel() {
-    const provider = createOpenAI({ apiKey: this.env.BAI_API_KEY, baseURL: this.env.BAI_BASE_URL });
+    const provider = createOpenAI({
+      apiKey: this.env.BAI_API_KEY,
+      baseURL: this.env.BAI_BASE_URL
+    });
     return provider("laguna-s-2.1");
+  }
+
+  getSearchMode(): SearchMode {
+    return this.state.searchMode ?? "auto";
+  }
+
+  setSearchMode(mode: SearchMode): SearchMode {
+    this.setState({ searchMode: mode });
+    console.log("[SEARCH MODE] changed", { mode });
+    return mode;
   }
 
   override getSystemPrompt(): string {
     const currentDate = new Date().toISOString().slice(0, 10);
-    const guaranteedWebContext = this.guaranteedWebContext;
-
     return [
       "You are a concise assistant replying inside a chat thread.",
       "Answer the user's latest message directly.",
       "Use plain text or simple Markdown only.",
-      `Current date: ${currentDate}. Treat this as the authoritative current date. Never invent or change the year.`,
-      "Your language model is provided by B.AI through an OpenAI-compatible API.",
-      "You have official Tavily web tools for search, deep research, and page extraction.",
-      "For current, latest, newest, 2026, best, top, recommendation, comparison, news, prices, versions, or time-sensitive questions, use tavily_search with advanced depth or tavily_research when deeper verification is useful.",
-      "For a user explicitly asking to search the web, actually use a web tool before answering; do not answer from memory alone.",
-      "Use tavily_research for deep research, multi-source comparison, fact checking, rankings, best-of questions, or questions where accuracy matters more than speed. Prefer mini for normal deep research; use pro only when the question is genuinely complex and the extra cost is justified.",
-      "Use tavily_search for quick current lookups and focused source discovery. Basic is cheaper; advanced is better for current/recommendation questions.",
-      "Use tavily_extract when you need the actual contents of one or more specific URLs returned by search or supplied by the user.",
-      "Do not claim that a search or research was performed unless the tool result confirms it.",
-      "Never invent sources, URLs, dates, versions, rankings, request IDs, credit usage, or current facts.",
-      "Never reveal API keys, environment secrets, hidden reasoning, or hidden tool internals.",
-      "For Cloudflare questions, prefer official Cloudflare and official npm sources when search results provide them.",
-      "Use fetch_to_markdown or browse only when you need a specific URL rendered/read through Cloudflare Browser Run.",
-      "Interactive browser_execute is intentionally not enabled because it requires Worker Loader/Dynamic Workers on the paid plan.",
-      guaranteedWebContext
-        ? [
-            "",
-            "GUARANTEED SERVER WEB SEARCH CONTEXT",
-            "The server executed Tavily before this turn because the user asked for web/current information.",
-            "Use the following real Tavily response as the factual source for this turn.",
-            "Do not invent URLs, prices, dates, sources, or facts not present below.",
-            "Do not claim that you used a model tool; state only that web results were consulted when appropriate.",
-            "",
-            guaranteedWebContext
-          ].join("\n")
-        : ""
-    ].filter(Boolean).join("\n");
+      `Current date: ${currentDate}. Treat this as authoritative. Never invent or change the year.`,
+      "The language model is provided by B.AI through an OpenAI-compatible API.",
+      "Search is orchestrated by the server.",
+      `Current search mode: ${this.getSearchMode()}.`,
+      "If the user explicitly names a search method, that explicit request overrides the selected button mode.",
+      "In Auto mode, the server selects the first suitable search method and can fall back to another method when the result is weak.",
+      "Use only the actual tool result as evidence. Never claim a search happened unless a tool result confirms it.",
+      "Never invent sources, URLs, dates, prices, versions, rankings, request IDs, or current facts.",
+      "For current or web-dependent questions, do not answer from memory when a search result is available.",
+      "For Cloudflare questions, prefer official Cloudflare sources when they appear in the results.",
+      "Never reveal API keys, environment secrets, hidden reasoning, or internal control markers."
+    ].join("\n");
   }
 
-  override async beforeTurn(context: TurnContext, _config: TurnConfig): Promise<void> {
-    this.guaranteedWebContext = null;
-    const userQuery = extractUserTextFromTurn(context);
+  override async beforeTurn(context: TurnContext): Promise<TurnConfig | void> {
+    const query = extractLatestUserText(context.messages);
+    const explicitMode = detectExplicitSearchMode(query);
+    const mode = explicitMode ?? this.getSearchMode();
 
-    if (!userQuery) {
-      console.log("[WEB FALLBACK] no user text found");
+    console.log("[SEARCH ORCHESTRATOR] turn", {
+      query: query.slice(0, 300),
+      selectedMode: this.getSearchMode(),
+      explicitMode,
+      effectiveMode: mode
+    });
+
+    if (mode === "none") {
+      return { activeTools: [], toolChoice: "none" };
+    }
+
+    if (!looksLikeWebRequest(query)) {
       return;
     }
 
-    if (!shouldUseGuaranteedWebSearch(userQuery)) {
-      console.log("[WEB FALLBACK] skipped", { query: userQuery.slice(0, 200) });
-      return;
+    if (mode === "auto") {
+      return {
+        activeTools: ["search_orchestrator"],
+        toolChoice: { type: "tool", toolName: "search_orchestrator" },
+        maxSteps: 3
+      };
     }
 
-    console.log("[WEB FALLBACK] running Tavily", { query: userQuery.slice(0, 200) });
-
-    try {
-      const result = await tavilySearch(this.env, userQuery, {
-        depth: "advanced",
-        topic: /news|خبر|قیمت|price|finance|مالی/iu.test(userQuery) ? "news" : "general",
-        maxResults: 6
-      });
-      this.guaranteedWebContext = result.context;
-      console.log("[WEB FALLBACK] Tavily completed", {
-        query: userQuery.slice(0, 200),
-        contextLength: result.context.length
-      });
-    } catch (error) {
-      console.error("[WEB FALLBACK] Tavily failed", {
-        message: error instanceof Error ? error.message : String(error)
-      });
-      this.guaranteedWebContext = null;
-    }
+    return {
+      activeTools: [mode],
+      toolChoice: { type: "tool", toolName: mode },
+      maxSteps: 3
+    };
   }
 
   override getTools(): ToolSet {
     console.log("[AGENT] getTools called");
 
     const tavilySearchTool = tool({
-      description: "Official Tavily web search. REQUIRED for explicit web-search requests and for current/latest/2026/best/top/recommendation/comparison/news/price/version questions. Returns ranked sources and URLs.",
+      description: "Official Tavily web search. Use for current facts, news, prices, versions, source discovery, and focused web searches.",
       inputSchema: jsonSchema<{ query: string; depth?: SearchDepth; topic?: SearchTopic; maxResults?: number }>({
         type: "object",
         properties: {
-          query: { type: "string", description: "Focused web search query; include the relevant year such as 2026 when the user asks for current information." },
+          query: { type: "string" },
           depth: { type: "string", enum: ["basic", "advanced"] },
           topic: { type: "string", enum: ["general", "news", "finance"] },
-          maxResults: { type: "number", description: "Maximum results, 1 to 10." }
+          maxResults: { type: "number" }
         },
         required: ["query"],
         additionalProperties: false
       }),
       execute: async ({ query, depth, topic, maxResults }) => {
         console.log("[AGENT TOOL] tavily_search", { query: cleanText(query, 300), depth, topic, maxResults });
-        const result = await tavilySearch(this.env, query, { depth, topic, maxResults });
-        return result.context;
+        return tavilySearch(this.env, query, {
+          depth: depth ?? "advanced",
+          topic,
+          maxResults
+        });
       }
     });
 
     const tavilyResearchTool = tool({
-      description: "Official Tavily Deep Research. Use for deep research, multi-source fact checking, comparisons, rankings, best-of questions, or explicit comprehensive research. Default to mini to conserve credits.",
+      description: "Official Tavily Deep Research for comprehensive multi-source research, fact checking, comparisons, and complex questions.",
       inputSchema: jsonSchema<{ query: string; model?: ResearchModel }>({
         type: "object",
         properties: {
-          query: { type: "string", description: "Precise research question. Include the current year when relevant." },
+          query: { type: "string" },
           model: { type: "string", enum: ["auto", "mini", "pro"] }
         },
         required: ["query"],
@@ -422,13 +425,12 @@ export class ConversationAgent extends Think {
       }),
       execute: async ({ query, model }) => {
         console.log("[AGENT TOOL] tavily_research", { query: cleanText(query, 300), model: model ?? "mini" });
-        const result = await tavilyResearch(this.env, query, model ?? "mini");
-        return result.context;
+        return tavilyResearch(this.env, query, model ?? "mini");
       }
     });
 
     const tavilyExtractTool = tool({
-      description: "Extract readable/raw content from up to 20 specific public URLs using Tavily.",
+      description: "Extract readable content from specific public URLs using Tavily.",
       inputSchema: jsonSchema<{ urls: string[] }>({
         type: "object",
         properties: { urls: { type: "array", items: { type: "string" } } },
@@ -437,23 +439,33 @@ export class ConversationAgent extends Think {
       }),
       execute: async ({ urls }) => {
         console.log("[AGENT TOOL] tavily_extract", { urlCount: urls.length });
-        const result = await tavilyExtract(this.env, urls);
-        return result.context;
+        return tavilyExtract(this.env, urls);
       }
     });
 
-    const fetchToMarkdown = tool({
-      description: "Fetch a public URL through Cloudflare Browser Run and return cleaned Markdown/text.",
+    const fetchMarkdownTool = tool({
+      description: "Fetch a specific public URL through Cloudflare Browser Run and return readable Markdown.",
       inputSchema: jsonSchema<{ url: string }>({
         type: "object",
         properties: { url: { type: "string" } },
         required: ["url"],
         additionalProperties: false
       }),
-      execute: async ({ url }) => browserMarkdown(this.env.BROWSER, url)
+      execute: async ({ url }) => fetchToMarkdown(this.env, url)
     });
 
-    const browse = tool({
+    const webSearchTool = tool({
+      description: "Search the public web through DuckDuckGo HTML results. This is the generic web-search path and does not use Tavily credits.",
+      inputSchema: jsonSchema<{ query: string }>({
+        type: "object",
+        properties: { query: { type: "string" } },
+        required: ["query"],
+        additionalProperties: false
+      }),
+      execute: async ({ query }) => webSearch(this.env, query)
+    });
+
+    const browseTool = tool({
       description: "Read a public URL as cleaned browser content.",
       inputSchema: jsonSchema<{ url: string }>({
         type: "object",
@@ -464,12 +476,78 @@ export class ConversationAgent extends Think {
       execute: async ({ url }) => browserContent(this.env.BROWSER, url)
     });
 
+    const searchOrchestratorTool = tool({
+      description: "Server-side automatic web research orchestrator. Select the best search method for the query and try up to three methods when results are weak.",
+      inputSchema: jsonSchema<{ query: string }>({
+        type: "object",
+        properties: { query: { type: "string" } },
+        required: ["query"],
+        additionalProperties: false
+      }),
+      execute: async ({ query }) => {
+        const first = chooseAutoSearchMode(query);
+        const plan: SearchMode[] = [
+          first,
+          ...(first === "tavily_research"
+            ? ["tavily_search", "web_search"] as SearchMode[]
+            : first === "tavily_search"
+              ? ["web_search", "tavily_research"] as SearchMode[]
+              : first === "web_search"
+                ? ["tavily_search", "tavily_research"] as SearchMode[]
+                : ["tavily_search", "web_search"] as SearchMode[])
+        ];
+
+        console.log("[SEARCH ORCHESTRATOR] plan", { query: cleanText(query, 300), plan });
+        const errors: string[] = [];
+
+        for (let index = 0; index < Math.min(plan.length, 3); index += 1) {
+          const method = plan[index];
+          try {
+            let result: string;
+            if (method === "tavily_search") {
+              result = await tavilySearch(this.env, query, { depth: "advanced", maxResults: 6 });
+            } else if (method === "tavily_research") {
+              result = await tavilyResearch(this.env, query, "mini");
+            } else if (method === "web_search") {
+              result = await webSearch(this.env, query);
+            } else if (method === "fetch_to_markdown") {
+              const url = query.match(/https?:\/\/[^\s]+/i)?.[0];
+              if (!url) throw new Error("No URL found for fetch_to_markdown");
+              result = await fetchToMarkdown(this.env, url);
+            } else {
+              continue;
+            }
+
+            const useful = searchResultLooksUseful(result);
+            console.log("[SEARCH ORCHESTRATOR] result", { method, attempt: index + 1, useful, length: result.length });
+            if (useful || index === plan.length - 1) {
+              return [
+                `SEARCH ORCHESTRATOR FINAL METHOD: ${method}`,
+                `ATTEMPTS: ${index + 1}`,
+                errors.length ? `PREVIOUS ERRORS: ${errors.join(" | ")}` : "",
+                "",
+                result
+              ].filter(Boolean).join("\n\n");
+            }
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            errors.push(`${method}: ${message}`);
+            console.error("[SEARCH ORCHESTRATOR] failed", { method, message });
+          }
+        }
+
+        throw new Error(`All automatic search methods failed: ${errors.join(" | ")}`);
+      }
+    });
+
     return {
+      search_orchestrator: searchOrchestratorTool,
       tavily_search: tavilySearchTool,
       tavily_research: tavilyResearchTool,
       tavily_extract: tavilyExtractTool,
-      fetch_to_markdown: fetchToMarkdown,
-      browse
+      web_search: webSearchTool,
+      fetch_to_markdown: fetchMarkdownTool,
+      browse: browseTool
     };
   }
 }
