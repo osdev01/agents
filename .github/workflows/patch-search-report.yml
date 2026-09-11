@@ -1,7 +1,8 @@
 name: Add search report
 
 on:
-  workflow_dispatch:
+  push:
+    branches: [main]
 
 jobs:
   patch:
@@ -96,14 +97,10 @@ function formatWebSearchReport(input: {
   ].filter(Boolean).join("\\n");
 }
 '''
-          if old not in s:
-              raise SystemExit('formatSearchResults target not found')
+          if old not in s: raise SystemExit('formatSearchResults target not found')
           s = s.replace(old, new, 1)
-          old2 = '''  return formatSearchResults(query, response);'''
-          new2 = '''  return formatSearchResults(query, response, depth);'''
-          if old2 not in s:
-              raise SystemExit('tavilySearch return target not found')
-          s = s.replace(old2, new2, 1)
+          if 'return formatSearchResults(query, response);' not in s: raise SystemExit('search return target not found')
+          s = s.replace('return formatSearchResults(query, response);', 'return formatSearchResults(query, response, depth);', 1)
           old3 = '''    `SOURCE COUNT: ${sources.length}`,
     "",
     "RESEARCH REPORT",'''
@@ -118,8 +115,7 @@ function formatWebSearchReport(input: {
     }),
     "",
     "RESEARCH REPORT",'''
-          if old3 not in s:
-              raise SystemExit('research report target not found')
+          if old3 not in s: raise SystemExit('research report target not found')
           s = s.replace(old3, new3, 1)
           old4 = '''    `FAILED: ${failed.length}`,
     response.usage?.credits !== undefined ? `TAVILY CREDITS USED: ${response.usage.credits}` : "",
@@ -134,8 +130,7 @@ function formatWebSearchReport(input: {
       sources: successful.map((item) => ({ title: "Extracted page", url: item.url }))
     }),
     "",'''
-          if old4 not in s:
-              raise SystemExit('extract report target not found')
+          if old4 not in s: raise SystemExit('extract report target not found')
           s = s.replace(old4, new4, 1)
           p.write_text(s)
           PY
@@ -144,7 +139,7 @@ function formatWebSearchReport(input: {
           git add examples/chat-sdk-messenger/src/intelligence/conversation-agent.ts
           git commit -m "feat: append factual Tavily search report"
           git push
-      - name: Remove patch workflow
+      - name: Remove temporary workflow
         if: always()
         shell: bash
         run: |
