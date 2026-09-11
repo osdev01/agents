@@ -1,5 +1,5 @@
 import { createOpenAI } from "@ai-sdk/openai";
-import { Think, type ChatResponseResult, type TurnContext, type TurnConfig } from "@cloudflare/think";
+import { Think, type ChatResponseResult } from "@cloudflare/think";
 import { browserContent, browserMarkdown } from "agents/browser";
 import { tool, jsonSchema, type ToolSet } from "ai";
 
@@ -32,24 +32,6 @@ function cleanText(value: string, max = 12000): string {
   return value.replace(/\s+/g, " ").trim().slice(0, max);
 }
 
-function messageText(message: unknown): string {
-  if (!message || typeof message !== "object") return "";
-  const candidate = message as { role?: unknown; content?: unknown };
-  if (candidate.role !== "user") return "";
-  if (typeof candidate.content === "string") return candidate.content;
-  if (!Array.isArray(candidate.content)) return "";
-  return candidate.content.map((part) => {
-    if (!part || typeof part !== "object") return "";
-    const text = (part as { text?: unknown }).text;
-    return typeof text === "string" ? text : "";
-  }).filter(Boolean).join("\n");
-}
-
-function extractExplicitSearchQuery(text: string): string | null {
-  const match = text.match(/(?:در\s+وب\s+جستجو\s+کن|در\s+اینترنت\s+جستجو\s+کن|وب\s+جستجو\s+کن|در\s+وب\s+سرچ\s+کن|سرچ\s+کن|جستجو\s+کن|search\s+the\s+web|search\s+online|search\s+the\s+internet)\s*:?[\s-]*(.+)$/iu);
-  return match?.[1]?.trim() || null;
-}
-
 function isCurrentOrRecommendationQuery(query: string): boolean {
   return /(latest|newest|current|today|now|2026|best|top|recommended|recommendation|comparison|compare|آخرین|جدیدترین|جدید|امروز|الان|بهترین|برتر|پیشنهاد|مقایسه)/iu.test(query);
 }
@@ -61,6 +43,8 @@ function getTavilyApiKey(env: Env): string {
 }
 
 async function tavilyRequest<T>(env: Env, path: string, body?: unknown, method: "GET" | "POST" = "POST"): Promise<T> {
+  console.log("[TAVILY] request", { path, method });
+
   const response = await fetch(`https://api.tavily.com${path}`, {
     method,
     headers: {
@@ -73,9 +57,22 @@ async function tavilyRequest<T>(env: Env, path: string, body?: unknown, method: 
 
   if (!response.ok) {
     const bodyText = cleanText(await response.text(), 1000);
+    console.error("[TAVILY] error", { path, status: response.status });
     throw new Error(`Tavily HTTP ${response.status}: ${bodyText}`);
   }
-  return await response.json() as T;
+
+  const parsed = await response.json() as T;
+  const metadata = parsed as T & {
+    request_id?: unknown;
+    usage?: { credits?: unknown };
+  };
+  console.log("[TAVILY] response", {
+    path,
+    status: response.status,
+    requestId: metadata.request_id,
+    credits: metadata.usage?.credits
+  });
+  return parsed;
 }
 
 function formatWebSearchReport(input: TavilyReport): string {
@@ -310,6 +307,7 @@ export class ConversationAgent extends Think {
         additionalProperties: false
       }),
       execute: async ({ query, depth, topic, maxResults }) => {
+        console.log("[AGENT TOOL] tavily_search", { query: cleanText(query, 300), depth, topic, maxResults });
         const result = await tavilySearch(this.env, query, { depth, topic, maxResults });
         this.pendingTavilyReport = result.report;
         return result.context;
@@ -328,6 +326,7 @@ export class ConversationAgent extends Think {
         additionalProperties: false
       }),
       execute: async ({ query, model }) => {
+        console.log("[AGENT TOOL] tavily_research", { query: cleanText(query, 300), model: model ?? "mini" });
         const result = await tavilyResearch(this.env, query, model ?? "mini");
         this.pendingTavilyReport = result.report;
         return result.context;
@@ -343,6 +342,7 @@ export class ConversationAgent extends Think {
         additionalProperties: false
       }),
       execute: async ({ urls }) => {
+        console.log("[AGENT TOOL] tavily_extract", { urlCount: urls.length });
         const result = await tavilyExtract(this.env, urls);
         this.pendingTavilyReport = result.report;
         return result.context;
@@ -377,31 +377,6 @@ export class ConversationAgent extends Think {
       tavily_extract: tavilyExtractTool,
       fetch_to_markdown: fetchToMarkdown,
       browse
-    };
-  }
-
-  override async beforeTurn(ctx: TurnContext): Promise<TurnConfig | void> {
-    if (ctx.continuation) return;
-
-    this.pendingTavilyReport = null;
-    const latestUserMessage = [...ctx.messages]
-      .reverse()
-      .map(messageText)
-      .find(Boolean);
-    const explicitSearchQuery = latestUserMessage
-      ? extractExplicitSearchQuery(latestUserMessage)
-      : null;
-
-    if (!explicitSearchQuery) return;
-
-    const directSearchResult = await tavilySearch(this.env, explicitSearchQuery, {
-      depth: "advanced",
-      maxResults: 8
-    });
-    this.pendingTavilyReport = directSearchResult.report;
-
-    return {
-      system: `${ctx.system}\n\n[SERVER-EXECUTED TAVILY SEARCH CONTEXT]\n${directSearchResult.context}\n\nThe web search above was executed directly by the server. Treat it as authoritative web-search context for this user request. Do not claim that no web-search tool is available. Do not invent or rewrite request IDs, credits, source URLs, dates, or other search metadata.`
     };
   }
 
