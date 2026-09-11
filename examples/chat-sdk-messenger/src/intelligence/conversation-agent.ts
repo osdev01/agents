@@ -1,5 +1,5 @@
 import { createOpenAI } from "@ai-sdk/openai";
-import { Think, type ChatResponseResult } from "@cloudflare/think";
+import { Think, type ChatResponseResult, type TurnContext, type TurnConfig } from "@cloudflare/think";
 import { browserContent, browserMarkdown } from "agents/browser";
 import { tool, jsonSchema, type ToolSet } from "ai";
 
@@ -34,6 +34,21 @@ function cleanText(value: string, max = 12000): string {
 
 function isCurrentOrRecommendationQuery(query: string): boolean {
   return /(latest|newest|current|today|now|2026|best|top|recommended|recommendation|comparison|compare|آخرین|جدیدترین|جدید|امروز|الان|بهترین|برتر|پیشنهاد|مقایسه)/iu.test(query);
+}
+
+function isExplicitWebSearchQuery(query: string): boolean {
+  return /(search|look\s*up|browse|web|internet|research|find\s+online|جستجو|جست‌وجو|وب|اینترنت|تحقیق|بررسی\s+کن|از\s+وب|با\s+اطلاعاتی\s+که\s+از\s+وب)/iu.test(query);
+}
+
+function isTimeQuery(query: string): boolean {
+  return /(what time|current time|time now|time is it|ساعت\s*(چند|چنده|فعلی)|الان\s*ساعت|زمان\s*فعلی|وقت\s+ایران|به\s+وقت\s+ایران)/iu.test(query);
+}
+
+function latestUserText(ctx: TurnContext): string {
+  const message = [...ctx.messages].reverse().find((item) => item.role === "user");
+  if (!message) return "";
+  if (typeof message.content === "string") return message.content;
+  return JSON.stringify(message.content ?? "");
 }
 
 function getTavilyApiKey(env: Env): string {
@@ -270,11 +285,22 @@ export class ConversationAgent extends Think {
 
   override getSystemPrompt(): string {
     const currentDate = new Date().toISOString().slice(0, 10);
+    const iranNow = new Date().toLocaleString("fa-IR", {
+      timeZone: "Asia/Tehran",
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+      hour12: false
+    });
     return [
       "You are a concise assistant replying inside a chat thread.",
       "Answer the user's latest message directly.",
       "Use plain text or simple Markdown only.",
       `Current date: ${currentDate}. Treat this as the authoritative current date. Never invent or change the year.`,
+      `Current server time in Iran/Tehran: ${iranNow}. For ordinary current-time questions, use this exact server-provided value instead of guessing or inventing a time.`,
       "Your language model is provided by B.AI through an OpenAI-compatible API.",
       "You have official Tavily web tools for search, deep research, and page extraction.",
       "For current, latest, newest, 2026, best, top, recommendation, comparison, news, prices, versions, or time-sensitive questions, use tavily_search with advanced depth or tavily_research when deeper verification is useful.",
@@ -284,12 +310,36 @@ export class ConversationAgent extends Think {
       "Use tavily_extract when you need the actual contents of one or more specific URLs returned by search or supplied by the user.",
       "Do not claim that a search or research was performed unless the tool result confirms it.",
       "Never invent sources, URLs, dates, versions, rankings, request IDs, credit usage, or current facts.",
+      "Never invent a Tavily request ID. Only report request_id values returned by the Tavily API.",
+      "Never state that tavily_extract, tavily_search, or tavily_research ran unless its tool result is actually present in the current turn.",
       "The final Tavily report is appended by the server from the actual Tavily response. Do not create or rewrite that report yourself.",
       "Never reveal API keys, environment secrets, hidden reasoning, or hidden tool internals.",
       "For Cloudflare questions, prefer official Cloudflare and official npm sources when search results provide them.",
       "Use fetch_to_markdown or browse only when you need a specific URL rendered/read through Cloudflare Browser Run.",
       "Interactive browser_execute is intentionally not enabled because it requires Worker Loader/Dynamic Workers on the paid plan."
     ].join("\n");
+  }
+
+  override beforeTurn(ctx: TurnContext): TurnConfig | void {
+    const query = latestUserText(ctx);
+    if (!query) return;
+
+    const explicitWeb = isExplicitWebSearchQuery(query);
+    const currentQuery = isCurrentOrRecommendationQuery(query);
+
+    if (explicitWeb || currentQuery) {
+      console.log("[SEARCH POLICY] forcing Tavily search", { query: cleanText(query, 300) });
+      return {
+        activeTools: ["tavily_search", "tavily_research", "tavily_extract", "fetch_to_markdown", "browse"],
+        toolChoice: { type: "tool", toolName: "tavily_search" },
+        maxSteps: 4
+      };
+    }
+
+    if (isTimeQuery(query)) {
+      console.log("[TIME POLICY] using server-provided Tehran time", { query: cleanText(query, 300) });
+      return { maxSteps: 2 };
+    }
   }
 
   override getTools(): ToolSet {
