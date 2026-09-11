@@ -24,20 +24,41 @@ jobs:
 
           path = Path(os.environ["TARGET"])
           text = path.read_text()
-
           marker = "MANDATORY DIRECT TAVILY SEARCH RESULT"
+
           if marker in text:
               print("Direct Tavily patch already present")
               raise SystemExit(0)
 
-          injected = r'''\n    if (!ctx.continuation) {\n      const latestUserMessage = [...ctx.messages]\n        .reverse()\n        .map(messageText)\n        .find(Boolean);\n      const explicitSearchQuery = latestUserMessage\n        ? extractExplicitSearchQuery(latestUserMessage)\n        : null;\n\n      if (explicitSearchQuery) {\n        const directSearchResult = await tavilySearch(this.env, explicitSearchQuery, {\n          depth: "advanced",\n          maxResults: 8\n        });\n\n        return {\n          system: `${ctx.system}\\n\\n[${marker}]\\n${directSearchResult}\\n\\nThe web search above was executed directly by the server. Treat it as authoritative web-search context for this user request. Do not claim that no web-search tool is available. Do not repeat the search unless the user explicitly asks for another search. Base current factual claims on these results and include the most relevant URLs.`\n        };\n      }\n    }\n'''
+          injected = """
+              if (!ctx.continuation) {
+                const latestUserMessage = [...ctx.messages]
+                  .reverse()
+                  .map(messageText)
+                  .find(Boolean);
+                const explicitSearchQuery = latestUserMessage
+                  ? extractExplicitSearchQuery(latestUserMessage)
+                  : null;
+
+                if (explicitSearchQuery) {
+                  const directSearchResult = await tavilySearch(this.env, explicitSearchQuery, {
+                    depth: "advanced",
+                    maxResults: 8
+                  });
+
+                  return {
+                    system: `${ctx.system}\\n\\n[${marker}]\\n${directSearchResult}\\n\\nThe web search above was executed directly by the server. Treat it as authoritative web-search context for this user request. Do not claim that no web-search tool is available. Do not repeat the search unless the user explicitly asks for another search. Base current factual claims on these results and include the most relevant URLs.`
+                  };
+                }
+              }
+          """
 
           pos = text.find("beforeTurn(")
           if pos >= 0:
               brace = text.find("{", pos)
               if brace < 0:
                   raise SystemExit("Could not locate beforeTurn body")
-              prefix = text[max(0, pos-40):pos]
+              prefix = text[max(0, pos-50):pos]
               if "async " not in prefix:
                   text = text[:pos] + "async " + text[pos:]
                   pos += len("async ")
@@ -47,16 +68,23 @@ jobs:
               insert_at = text.rfind("\n}")
               if insert_at < 0:
                   raise SystemExit("Could not locate ConversationAgent class closing brace")
-              method = r'''\n\n  override async beforeTurn(ctx: TurnContext): Promise<TurnConfig | void> {''' + injected + r'''\n  }\n'''
+              method = """
+
+            override async beforeTurn(ctx: TurnContext): Promise<TurnConfig | void> {
+          """ + injected + """
+            }
+          """
               text = text[:insert_at] + method + text[insert_at:]
 
           path.write_text(text)
+          print("Patched", path)
           PY
 
       - name: Verify patch
         run: |
           grep -n "MANDATORY DIRECT TAVILY SEARCH RESULT" examples/chat-sdk-messenger/src/intelligence/conversation-agent.ts
-          grep -n "override async beforeTurn\|async beforeTurn" examples/chat-sdk-messenger/src/intelligence/conversation-agent.ts
+          grep -n "async beforeTurn" examples/chat-sdk-messenger/src/intelligence/conversation-agent.ts
+          git diff --check
 
       - name: Commit patch and remove temporary workflow
         run: |
