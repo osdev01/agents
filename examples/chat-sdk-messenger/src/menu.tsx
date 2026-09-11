@@ -3,24 +3,9 @@
 import { Actions, Button, Card, CardText } from "chat";
 import { CARD_DEMOS, FILE_DEMOS, MARKDOWN_DEMOS } from "./demos";
 import type { Demo, DemoThread } from "./demos";
-import type { SearchMode } from "./intelligence/conversation-agent";
 
 export const MAIN_MENU_ID = "menu-main";
 export const ASK_AGENT_ACTION_ID = "ask-agent";
-export const SEARCH_MENU_ID = "menu-search";
-export const SEARCH_MODE_ACTIONS = {
-  auto: "search-mode-auto",
-  tavily_search: "search-mode-tavily-search",
-  tavily_research: "search-mode-tavily-research",
-  web_search: "search-mode-web-search",
-  fetch_to_markdown: "search-mode-fetch-markdown",
-  none: "search-mode-none"
-} as const satisfies Record<SearchMode, string>;
-
-export const SEARCH_MODE_BY_ACTION = new Map<string, SearchMode>(
-  Object.entries(SEARCH_MODE_ACTIONS).map(([mode, actionId]) => [actionId, mode as SearchMode])
-);
-
 const MARKDOWN_MENU_ID = "menu-md";
 const CARDS_MENU_ID = "menu-card";
 const FILES_MENU_ID = "menu-file";
@@ -29,8 +14,7 @@ export const MENU_IDS = new Set([
   MAIN_MENU_ID,
   MARKDOWN_MENU_ID,
   CARDS_MENU_ID,
-  FILES_MENU_ID,
-  SEARCH_MENU_ID
+  FILES_MENU_ID
 ]);
 
 const DEMO_GROUPS = [
@@ -71,9 +55,6 @@ export async function postMainMenu(thread: DemoThread): Promise<void> {
         </Actions>
       ))}
       <Actions>
-        <Button id={SEARCH_MENU_ID}>🔎 Search method</Button>
-      </Actions>
-      <Actions>
         <Button id={ASK_AGENT_ACTION_ID}>Ask the Agent</Button>
       </Actions>
     </Card>
@@ -87,61 +68,16 @@ export async function postAskAgentInstructions(
     <Card title="Ask the Agent">
       <CardText>
         DM me a question for an AI response. In a group, mention me or start a
-        message with /ask. Use /search to choose the search method. Send /reset
-        to clear this thread's AI history.
+        message with /ask. Send /reset to clear this thread's AI history.
       </CardText>
-    </Card>
-  );
-}
-
-export async function postSearchMenu(
-  thread: DemoThread,
-  currentMode: SearchMode = "auto"
-): Promise<void> {
-  const label = (mode: SearchMode, text: string) =>
-    `${currentMode === mode ? "✅ " : ""}${text}`;
-
-  await thread.post(
-    <Card title="🔎 Search method">
-      <CardText>
-        Auto lets the agent choose a method. If you explicitly name a method in
-        your prompt, that explicit request always wins.
-      </CardText>
-      <Actions>
-        <Button id={SEARCH_MODE_ACTIONS.auto}>{label("auto", "🤖 Auto + fallback")}</Button>
-      </Actions>
-      <Actions>
-        <Button id={SEARCH_MODE_ACTIONS.tavily_search}>{label("tavily_search", "🧠 Tavily Search")}</Button>
-      </Actions>
-      <Actions>
-        <Button id={SEARCH_MODE_ACTIONS.tavily_research}>{label("tavily_research", "🔬 Tavily Research")}</Button>
-      </Actions>
-      <Actions>
-        <Button id={SEARCH_MODE_ACTIONS.web_search}>{label("web_search", "🌐 Web Search")}</Button>
-      </Actions>
-      <Actions>
-        <Button id={SEARCH_MODE_ACTIONS.fetch_to_markdown}>{label("fetch_to_markdown", "📄 Fetch Markdown")}</Button>
-      </Actions>
-      <Actions>
-        <Button id={SEARCH_MODE_ACTIONS.none}>{label("none", "🚫 No web search")}</Button>
-      </Actions>
-      <Actions>
-        <Button id={MAIN_MENU_ID}>Back to main menu</Button>
-      </Actions>
     </Card>
   );
 }
 
 export async function postMenu(
   thread: DemoThread,
-  menuId: string,
-  currentSearchMode: SearchMode = "auto"
+  menuId: string
 ): Promise<void> {
-  if (menuId === SEARCH_MENU_ID) {
-    await postSearchMenu(thread, currentSearchMode);
-    return;
-  }
-
   const group = DEMO_GROUPS.find((item) => item.id === menuId);
   if (!group) {
     await postMainMenu(thread);
@@ -156,9 +92,6 @@ export async function postMenu(
           <Button id={demo.id}>{demo.label}</Button>
         </Actions>
       ))}
-      <Actions>
-        <Button id={SEARCH_MENU_ID}>🔎 Search method</Button>
-      </Actions>
       <Actions>
         <Button id={MAIN_MENU_ID}>Back to main menu</Button>
       </Actions>
