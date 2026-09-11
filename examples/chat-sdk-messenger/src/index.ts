@@ -264,7 +264,7 @@ export class ChatIngressAgent extends Agent {
       LIMIT 1
     `;
     if (!rows[0]) {
-      return new Response(`Conversation \"${name}\" not found`, { status: 404 });
+      return new Response(`Conversation "${name}" not found`, { status: 404 });
     }
   }
 
@@ -306,7 +306,12 @@ export class ChatIngressAgent extends Agent {
 
   @callable()
   async listReplyJobs(threadId?: string): Promise<AdminReplyJob[]> {
-    return (await this.listFibers({ name: AI_REPLY_FIBER_NAME, limit: 100 }))
+    return (
+      await this.listFibers({
+        name: AI_REPLY_FIBER_NAME,
+        limit: 100
+      })
+    )
       .map(adminReplyJobFromFiber)
       .filter((job) => threadId === undefined || job.threadId === threadId);
   }
@@ -329,17 +334,17 @@ export class ChatIngressAgent extends Agent {
     const mode = aiReplyRecoveryMode(snapshot);
     if (mode === "answer") {
       await this.answerWithConversationAgent(restored.thread, restored.message);
-    } else if (mode === "apologize") {
+      return;
+    }
+
+    if (mode === "apologize") {
       await restored.thread.post(INTERRUPTED_AI_RESPONSE);
     }
   }
 
   async onRequest(request: Request): Promise<Response> {
     const url = new URL(request.url);
-    if (
-      request.method !== "POST" ||
-      url.pathname !== WEBHOOK_PATH
-    ) {
+    if (request.method !== "POST" || url.pathname !== WEBHOOK_PATH) {
       return new Response("Not found", { status: 404 });
     }
 
@@ -357,6 +362,7 @@ export class ChatIngressAgent extends Agent {
     if (this.bot) {
       return this.bot;
     }
+
     return (
       this.botStartupError ??
       new Error("Chat SDK runtime was not created during Agent startup")
@@ -372,7 +378,11 @@ export class ChatIngressAgent extends Agent {
       LIMIT 1
     `;
     const row = rows[0];
-    return row ? adminConversationFromRow(row) : null;
+    if (!row) {
+      return null;
+    }
+
+    return adminConversationFromRow(row);
   }
 
   private readConversations(): AdminConversation[] {
@@ -383,6 +393,7 @@ export class ChatIngressAgent extends Agent {
       ORDER BY last_message_at DESC
       LIMIT 100
     `;
+
     return rows.map(adminConversationFromRow);
   }
 
@@ -399,11 +410,11 @@ export class ChatIngressAgent extends Agent {
     await this.subAgent(ConversationAgent, conversationName);
     this.sql`
       INSERT INTO chat_admin_conversations
-        (thread_id, conversation_name, provider, title,
-         last_message_preview, created_at, last_message_at)
+        (thread_id, conversation_name, provider, title, last_message_preview,
+         created_at, last_message_at)
       VALUES
-        (${thread.id}, ${conversationName}, ${provider}, ${title},
-         ${preview}, ${now}, ${now})
+        (${thread.id}, ${conversationName}, ${provider}, ${title}, ${preview},
+         ${now}, ${now})
       ON CONFLICT(thread_id) DO UPDATE SET
         conversation_name = excluded.conversation_name,
         provider = excluded.provider,
@@ -434,20 +445,22 @@ export class ChatIngressAgent extends Agent {
     let agent: SubAgentStub<ConversationAgent> | undefined;
     let completedModelTurn = false;
     fiber?.stash(aiReplySnapshot("streaming", thread, message));
+    const post = thread
+      .post(callback.stream())
+      .catch(async (error: unknown) => {
+        if (isExpectedFinalEditNoop(error, callback)) {
+          return;
+        }
 
-    const post = thread.post(callback.stream()).catch(async (error: unknown) => {
-      if (isExpectedFinalEditNoop(error, callback)) {
-        return;
-      }
-      const requestId = callback.requestId();
-      if (agent && requestId) {
-        await agent
-          .cancelChat(requestId, toError(error).message)
-          .catch(() => undefined);
-      }
-      callback.fail(error);
-      throw error;
-    });
+        const requestId = callback.requestId();
+        if (agent && requestId) {
+          await agent
+            .cancelChat(requestId, toError(error).message)
+            .catch(() => undefined);
+        }
+        callback.fail(error);
+        throw error;
+      });
 
     try {
       await thread.startTyping("Thinking...");
@@ -475,13 +488,16 @@ export class ChatIngressAgent extends Agent {
         fiber?.stash(aiReplySnapshot("completed", thread, message));
         return;
       }
+
       if (failureMode === "apologize") {
         await thread.post(INTERRUPTED_AI_RESPONSE).catch(() => undefined);
         fiber?.stash(aiReplySnapshot("completed", thread, message));
         return;
       }
+
+      const errorMessage = toError(error).message;
       await thread.post({
-        markdown: `Sorry, I couldn't answer that right now.\n\n${toError(error).message}`
+        markdown: `Sorry, I couldn't answer that right now.\n\n${errorMessage}`
       });
       fiber?.stash(aiReplySnapshot("completed", thread, message));
     }
@@ -529,10 +545,7 @@ export class ChatIngressAgent extends Agent {
   private getConversationAgent(
     thread: Thread
   ): Promise<SubAgentStub<ConversationAgent>> {
-    return this.subAgent(
-      ConversationAgent,
-      conversationNameForThread(thread)
-    );
+    return this.subAgent(ConversationAgent, conversationNameForThread(thread));
   }
 
   private shardThread(threadId: string): string {
@@ -561,10 +574,10 @@ function setupResponse(request: Request, env: Cloudflare.Env): Response {
       "",
       "Set the Telegram webhook with:",
       "",
-      `curl -X POST \"https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/setWebhook\" \\",
-      `  -H \"Content-Type: application/json\" \\",
+      `curl -X POST "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/setWebhook" \\`,
+      `  -H "Content-Type: application/json" \\`,
       `  -d '{`,
-      `    \"url\": \"${webhookUrl}\",`,
+      `    "url": "${webhookUrl}",`,
       secretLine,
       `  }'`,
       "",
@@ -573,7 +586,9 @@ function setupResponse(request: Request, env: Cloudflare.Env): Response {
         : "TELEGRAM_BOT_TOKEN is not configured."
     ].join("\n"),
     {
-      headers: { "content-type": "text/plain; charset=utf-8" }
+      headers: {
+        "content-type": "text/plain; charset=utf-8"
+      }
     }
   );
 }
