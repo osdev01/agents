@@ -304,6 +304,27 @@ export class ConversationAgent extends Think {
   }
 
   override async beforeTurn(ctx: TurnContext): Promise<TurnConfig | void> {
+    if (!ctx.continuation) {
+      const latestUserMessage = [...ctx.messages]
+        .reverse()
+        .map(messageText)
+        .find(Boolean);
+      const explicitSearchQuery = latestUserMessage
+        ? extractExplicitSearchQuery(latestUserMessage)
+        : null;
+
+      if (explicitSearchQuery) {
+        const directSearchResult = await tavilySearch(this.env, explicitSearchQuery, {
+          depth: "advanced",
+          maxResults: 8
+        });
+
+        return {
+          system: `${ctx.system}\n\n[MANDATORY DIRECT TAVILY SEARCH RESULT]\n${directSearchResult}\n\nThe web search above was executed directly by the server. Treat it as authoritative web-search context for this user request. Do not claim that no web-search tool is available. Do not repeat the search unless the user explicitly asks for another search. Base current factual claims on these results and include the most relevant URLs.`
+        };
+      }
+    }
+
     if (ctx.continuation) return;
     const latestUserMessage = [...ctx.messages].reverse().find((message) => message.role === "user");
     const query = extractExplicitSearchQuery(messageText(latestUserMessage));
