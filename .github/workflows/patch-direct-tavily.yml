@@ -46,7 +46,7 @@ jobs:
                   });
 
                   return {
-                    system: `${ctx.system}\\n\\n[${marker}]\\n${directSearchResult}\\n\\nThe web search above was executed directly by the server. Treat it as authoritative web-search context for this user request. Do not claim that no web-search tool is available. Do not repeat the search unless the user explicitly asks for another search. Base current factual claims on these results and include the most relevant URLs.`
+                    system: `${ctx.system}\\n\\n[MANDATORY DIRECT TAVILY SEARCH RESULT]\\n${directSearchResult}\\n\\nThe web search above was executed directly by the server. Treat it as authoritative web-search context for this user request. Do not claim that no web-search tool is available. Do not repeat the search unless the user explicitly asks for another search. Base current factual claims on these results and include the most relevant URLs.`
                   };
                 }
               }
@@ -83,6 +83,7 @@ jobs:
         run: |
           grep -n "MANDATORY DIRECT TAVILY SEARCH RESULT" examples/chat-sdk-messenger/src/intelligence/conversation-agent.ts
           grep -n "async beforeTurn" examples/chat-sdk-messenger/src/intelligence/conversation-agent.ts
+          grep -n "directSearchResult = await tavilySearch" examples/chat-sdk-messenger/src/intelligence/conversation-agent.ts
           git diff --check
 
       - name: Commit patch and remove temporary workflow
