@@ -1,7 +1,6 @@
 import { createOpenAI } from "@ai-sdk/openai";
 import { Think, type TurnContext, type TurnConfig } from "@cloudflare/think";
 import { browserContent, browserMarkdown } from "agents/browser";
-import { tavily } from "@tavily/core";
 import { tool, jsonSchema, type ToolSet } from "ai";
 
 type SearchDepth = "basic" | "advanced";
@@ -15,6 +14,8 @@ type TavilySearchResult = {
   score?: number;
   publishedDate?: string;
 };
+
+type TavilyUsage = { credits?: number };
 
 function cleanText(value: string, max = 12000): string {
   return value.replace(/\s+/g, " ").trim().slice(0, max);
@@ -42,19 +43,41 @@ function isCurrentOrRecommendationQuery(query: string): boolean {
   return /(latest|newest|current|today|now|2026|best|top|recommended|recommendation|comparison|compare|آخرین|جدیدترین|جدید|امروز|الان|بهترین|برتر|پیشنهاد|مقایسه)/iu.test(query);
 }
 
-function getTavilyClient(env: Env) {
+function getTavilyApiKey(env: Env): string {
   const apiKey = (env as Env & { TAVILY_API_KEY?: string }).TAVILY_API_KEY;
   if (!apiKey) throw new Error("Tavily is not configured: TAVILY_API_KEY is missing");
-  return tavily({ apiKey, clientName: "cloudflare-agents-telegram" });
+  return apiKey;
 }
 
-function formatSearchResults(query: string, response: { results?: TavilySearchResult[]; requestId?: string; usage?: { credits?: number } }): string {
+async function tavilyRequest<T>(env: Env, path: string, body?: unknown, method: "GET" | "POST" = "POST"): Promise<T> {
+  const response = await fetch(`https://api.tavily.com${path}`, {
+    method,
+    headers: {
+      Authorization: `Bearer ${getTavilyApiKey(env)}`,
+      "Content-Type": "application/json",
+      "X-Client-Name": "cloudflare-agents-telegram"
+    },
+    ...(body === undefined ? {} : { body: JSON.stringify(body) })
+  });
+
+  if (!response.ok) {
+    const bodyText = cleanText(await response.text(), 1000);
+    throw new Error(`Tavily HTTP ${response.status}: ${bodyText}`);
+  }
+  return await response.json() as T;
+}
+
+function formatSearchResults(query: string, response: {
+  results?: TavilySearchResult[];
+  request_id?: string;
+  usage?: TavilyUsage;
+}): string {
   const results = response.results ?? [];
   return [
     "TAVILY SEARCH RESULT",
     `QUERY: ${query}`,
     `SEARCH DEPTH: ${isCurrentOrRecommendationQuery(query) ? "advanced" : "basic"}`,
-    response.requestId ? `REQUEST ID: ${response.requestId}` : "",
+    response.request_id ? `REQUEST ID: ${response.request_id}` : "",
     response.usage?.credits !== undefined ? `TAVILY CREDITS USED: ${response.usage.credits}` : "",
     `RESULT COUNT: ${results.length}`,
     "",
@@ -72,17 +95,20 @@ async function tavilySearch(
   query: string,
   options: { depth?: SearchDepth; topic?: SearchTopic; maxResults?: number } = {}
 ): Promise<string> {
-  const client = getTavilyClient(env);
   const depth = options.depth ?? (isCurrentOrRecommendationQuery(query) ? "advanced" : "basic");
   const maxResults = Math.min(Math.max(options.maxResults ?? 6, 1), 10);
-  const response = await client.search(query, {
-    searchDepth: depth,
+  const response = await tavilyRequest<{
+    results?: TavilySearchResult[];
+    request_id?: string;
+    usage?: TavilyUsage;
+  }>(env, "/search", {
+    query,
+    search_depth: depth,
     topic: options.topic ?? "general",
-    maxResults,
-    includeAnswer: false,
-    includeRawContent: false,
-    includeUsage: true,
-    ...(depth === "advanced" ? { chunksPerSource: 2 } : {})
+    max_results: maxResults,
+    include_answer: false,
+    include_raw_content: false,
+    ...(depth === "advanced" ? { chunks_per_source: 2 } : {})
   });
   return formatSearchResults(query, response);
 }
@@ -97,7 +123,7 @@ function formatResearchResult(query: string, model: ResearchModel, result: {
   status?: string;
   content?: unknown;
   sources?: Array<{ title?: string; url?: string; snippet?: string }>;
-  requestId?: string;
+  request_id?: string;
 }): string {
   const sources = result.sources ?? [];
   return [
@@ -105,7 +131,7 @@ function formatResearchResult(query: string, model: ResearchModel, result: {
     `QUERY: ${query}`,
     `MODEL: ${model}`,
     `STATUS: ${result.status || "completed"}`,
-    result.requestId ? `REQUEST ID: ${result.requestId}` : "",
+    result.request_id ? `REQUEST ID: ${result.request_id}` : "",
     `SOURCE COUNT: ${sources.length}`,
     "",
     "RESEARCH REPORT",
@@ -118,16 +144,12 @@ function formatResearchResult(query: string, model: ResearchModel, result: {
   ].filter(Boolean).join("\n\n");
 }
 
-async function tavilyResearch(
-  env: Env,
-  query: string,
-  model: ResearchModel = "mini"
-): Promise<string> {
-  const client = getTavilyClient(env);
-  const response = await client.research(query, {
+async function tavilyResearch(env: Env, query: string, model: ResearchModel = "mini"): Promise<string> {
+  const response = await tavilyRequest<{ request_id?: string }>(env, "/research", {
+    input: query,
     model,
-    citationFormat: "numbered",
-    outputSchema: {
+    citation_format: "numbered",
+    output_schema: {
       type: "object",
       properties: {
         summary: { type: "string" },
@@ -138,17 +160,22 @@ async function tavilyResearch(
     }
   });
 
-  const requestId = response.requestId;
+  const requestId = response.request_id;
   if (!requestId) throw new Error("Tavily Research did not return a request ID");
 
-  for (let attempt = 0; attempt < 24; attempt++) {
-    const result = await client.getResearch(requestId);
+  for (let attempt = 0; attempt < 40; attempt++) {
+    const result = await tavilyRequest<{
+      status?: string;
+      content?: unknown;
+      sources?: Array<{ title?: string; url?: string; snippet?: string }>;
+      request_id?: string;
+    }>(env, `/research/${encodeURIComponent(requestId)}`, undefined, "GET");
     const status = String(result.status || "").toLowerCase();
-    if (status === "completed" || status === "complete" || status === "failed" || status === "error") {
-      if (status === "failed" || status === "error") {
-        throw new Error(`Tavily Research failed with status: ${status}`);
-      }
+    if (status === "completed" || status === "complete") {
       return formatResearchResult(query, model, result);
+    }
+    if (status === "failed" || status === "error") {
+      throw new Error(`Tavily Research failed with status: ${status}`);
     }
     await new Promise((resolve) => setTimeout(resolve, 1500));
   }
@@ -157,12 +184,17 @@ async function tavilyResearch(
 }
 
 async function tavilyExtract(env: Env, urls: string[]): Promise<string> {
-  const client = getTavilyClient(env);
   const limitedUrls = urls.filter((url) => /^https?:\/\//i.test(url)).slice(0, 20);
   if (!limitedUrls.length) throw new Error("Provide at least one valid HTTP(S) URL");
-  const response = await client.extract(limitedUrls, { includeUsage: true });
+  const response = await tavilyRequest<{
+    results?: Array<{ url?: string; raw_content?: string }>;
+    failed_results?: Array<{ url?: string; error?: string }>;
+    usage?: TavilyUsage;
+  }>(env, "/extract", {
+    urls: limitedUrls
+  });
   const successful = response.results ?? [];
-  const failed = response.failedResults ?? [];
+  const failed = response.failed_results ?? [];
   return [
     "TAVILY EXTRACT RESULT",
     `REQUESTED URLS: ${limitedUrls.length}`,
@@ -170,8 +202,8 @@ async function tavilyExtract(env: Env, urls: string[]): Promise<string> {
     `FAILED: ${failed.length}`,
     response.usage?.credits !== undefined ? `TAVILY CREDITS USED: ${response.usage.credits}` : "",
     "",
-    ...successful.map((item, index) => `${index + 1}. URL: ${item.url}\nCONTENT:\n${cleanText(item.rawContent || "", 10000)}`),
-    failed.length ? `FAILED URLS:\n${failed.map((item) => `${item.url}: ${item.error}`).join("\n")}` : ""
+    ...successful.map((item, index) => `${index + 1}. URL: ${item.url || ""}\nCONTENT:\n${cleanText(item.raw_content || "", 10000)}`),
+    failed.length ? `FAILED URLS:\n${failed.map((item) => `${item.url || "unknown"}: ${item.error || "unknown error"}`).join("\n")}` : ""
   ].filter(Boolean).join("\n\n");
 }
 
