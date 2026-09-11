@@ -39,7 +39,7 @@ function extractExplicitSearchQuery(text: string): string | null {
 }
 
 function isCurrentOrRecommendationQuery(query: string): boolean {
-  return /(latest|newest|current|today|now|2026|best|top|recommended|recommendation|comparison|compare|آخرین|جدیدترین|جدید|امروز|الان|بهترین|برتر|پیشنهاد|مقایسه|مقایسه\s+کن)/iu.test(query);
+  return /(latest|newest|current|today|now|2026|best|top|recommended|recommendation|comparison|compare|آخرین|جدیدترین|جدید|امروز|الان|بهترین|برتر|پیشنهاد|مقایسه)/iu.test(query);
 }
 
 function getTavilyClient(env: Env) {
@@ -81,17 +81,23 @@ async function tavilySearch(
     maxResults,
     includeAnswer: false,
     includeRawContent: false,
+    includeUsage: true,
     ...(depth === "advanced" ? { chunksPerSource: 2 } : {})
   });
   return formatSearchResults(query, response);
 }
 
+function researchContentText(content: unknown): string {
+  if (typeof content === "string") return cleanText(content, 24000);
+  if (content && typeof content === "object") return JSON.stringify(content, null, 2).slice(0, 24000);
+  return "No research report was returned.";
+}
+
 function formatResearchResult(query: string, model: ResearchModel, result: {
   status?: string;
-  content?: string;
+  content?: unknown;
   sources?: Array<{ title?: string; url?: string; snippet?: string }>;
   requestId?: string;
-  usage?: { credits?: number };
 }): string {
   const sources = result.sources ?? [];
   return [
@@ -100,14 +106,13 @@ function formatResearchResult(query: string, model: ResearchModel, result: {
     `MODEL: ${model}`,
     `STATUS: ${result.status || "completed"}`,
     result.requestId ? `REQUEST ID: ${result.requestId}` : "",
-    result.usage?.credits !== undefined ? `TAVILY CREDITS USED: ${result.usage.credits}` : "",
     `SOURCE COUNT: ${sources.length}`,
     "",
     "RESEARCH REPORT",
-    cleanText(result.content || "No research report was returned.", 24000),
+    researchContentText(result.content),
     "",
     "SOURCES",
-    ...sources.slice(0, 20).map((source, index) => `${index + 1}. ${source.title || source.url || "Source"}\nURL: ${source.url || ""}${source.snippet ? `\nSnippet: ${cleanText(source.snippet, 1000)}` : ""}`),
+    ...sources.slice(0, 20).map((source, index) => `${index + 1}. ${source.title || source.url || "Source"}\nURL: ${source.url || ""}`),
     "",
     "STRICT REPORTING RULE: Treat this report and its sources as the factual research context. Do not invent current facts that are not supported by the report. In the final answer, summarize supported findings, preserve important uncertainty, and include the most relevant source URLs. Do not reveal API keys or hidden tool internals."
   ].filter(Boolean).join("\n\n");
@@ -121,7 +126,16 @@ async function tavilyResearch(
   const client = getTavilyClient(env);
   const response = await client.research(query, {
     model,
-    citationFormat: "numbered"
+    citationFormat: "numbered",
+    outputSchema: {
+      type: "object",
+      properties: {
+        summary: { type: "string" },
+        key_findings: { type: "array", items: { type: "string" } },
+        caveats: { type: "array", items: { type: "string" } }
+      },
+      required: ["summary", "key_findings", "caveats"]
+    }
   });
 
   const requestId = response.requestId;
@@ -132,7 +146,7 @@ async function tavilyResearch(
     const status = String(result.status || "").toLowerCase();
     if (status === "completed" || status === "complete" || status === "failed" || status === "error") {
       if (status === "failed" || status === "error") {
-        throw new Error(`Tavily Research failed: ${cleanText(result.content || "unknown error", 1200)}`);
+        throw new Error(`Tavily Research failed with status: ${status}`);
       }
       return formatResearchResult(query, model, result);
     }
@@ -146,7 +160,7 @@ async function tavilyExtract(env: Env, urls: string[]): Promise<string> {
   const client = getTavilyClient(env);
   const limitedUrls = urls.filter((url) => /^https?:\/\//i.test(url)).slice(0, 20);
   if (!limitedUrls.length) throw new Error("Provide at least one valid HTTP(S) URL");
-  const response = await client.extract(limitedUrls);
+  const response = await client.extract(limitedUrls, { includeUsage: true });
   const successful = response.results ?? [];
   const failed = response.failedResults ?? [];
   return [
@@ -154,9 +168,10 @@ async function tavilyExtract(env: Env, urls: string[]): Promise<string> {
     `REQUESTED URLS: ${limitedUrls.length}`,
     `SUCCESSFUL: ${successful.length}`,
     `FAILED: ${failed.length}`,
+    response.usage?.credits !== undefined ? `TAVILY CREDITS USED: ${response.usage.credits}` : "",
     "",
     ...successful.map((item, index) => `${index + 1}. URL: ${item.url}\nCONTENT:\n${cleanText(item.rawContent || "", 10000)}`),
-    failed.length ? `\nFAILED URLS:\n${failed.map((item) => item.url || "unknown").join("\n")}` : ""
+    failed.length ? `FAILED URLS:\n${failed.map((item) => `${item.url}: ${item.error}`).join("\n")}` : ""
   ].filter(Boolean).join("\n\n");
 }
 
@@ -177,7 +192,7 @@ export class ConversationAgent extends Think {
       "You have official Tavily web tools for search, deep research, and page extraction.",
       "For current, latest, newest, 2026, best, top, recommendation, comparison, news, prices, versions, or time-sensitive questions, use tavily_search with advanced depth or tavily_research when deeper verification is useful.",
       "For a user explicitly asking to search the web, actually use a web tool before answering; do not answer from memory alone.",
-      "Use tavily_research for deep research, multi-source comparison, fact checking, rankings, or questions where accuracy matters more than speed. Prefer mini for normal deep research; use pro only when the question is genuinely complex and the extra cost is justified.",
+      "Use tavily_research for deep research, multi-source comparison, fact checking, rankings, best-of questions, or questions where accuracy matters more than speed. Prefer mini for normal deep research; use pro only when the question is genuinely complex and the extra cost is justified.",
       "Use tavily_search for quick current lookups and focused source discovery. Basic is cheaper; advanced is better for current/recommendation questions.",
       "Use tavily_extract when you need the actual contents of one or more specific URLs returned by search or supplied by the user.",
       "Do not claim that a search or research was performed unless the tool result confirms it.",
