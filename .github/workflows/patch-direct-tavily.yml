@@ -9,7 +9,7 @@ permissions:
 
 jobs:
   patch:
-    if: !startsWith(github.event.head_commit.message, 'chore: apply direct Tavily search')
+    if: ${{ !startsWith(github.event.head_commit.message, 'chore: apply direct Tavily search') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -32,13 +32,11 @@ jobs:
 
           injected = r'''\n    if (!ctx.continuation) {\n      const latestUserMessage = [...ctx.messages]\n        .reverse()\n        .map(messageText)\n        .find(Boolean);\n      const explicitSearchQuery = latestUserMessage\n        ? extractExplicitSearchQuery(latestUserMessage)\n        : null;\n\n      if (explicitSearchQuery) {\n        const directSearchResult = await tavilySearch(this.env, explicitSearchQuery, {\n          depth: "advanced",\n          maxResults: 8\n        });\n\n        return {\n          system: `${ctx.system}\\n\\n[${marker}]\\n${directSearchResult}\\n\\nThe web search above was executed directly by the server. Treat it as authoritative web-search context for this user request. Do not claim that no web-search tool is available. Do not repeat the search unless the user explicitly asks for another search. Base current factual claims on these results and include the most relevant URLs.`\n        };\n      }\n    }\n'''
 
-          # Find an existing beforeTurn hook, if present.
           pos = text.find("beforeTurn(")
           if pos >= 0:
               brace = text.find("{", pos)
               if brace < 0:
                   raise SystemExit("Could not locate beforeTurn body")
-              # Make an existing hook async if needed because the direct search awaits fetch().
               prefix = text[max(0, pos-40):pos]
               if "async " not in prefix:
                   text = text[:pos] + "async " + text[pos:]
@@ -46,7 +44,6 @@ jobs:
                   brace = text.find("{", pos)
               text = text[:brace+1] + injected + text[brace+1:]
           else:
-              # Add the hook before the final class closing brace.
               insert_at = text.rfind("\n}")
               if insert_at < 0:
                   raise SystemExit("Could not locate ConversationAgent class closing brace")
