@@ -67,16 +67,46 @@ async function tavilyRequest<T>(env: Env, path: string, body?: unknown, method: 
   return await response.json() as T;
 }
 
+function formatWebSearchReport(input: {
+  type: string;
+  depth?: string;
+  model?: string;
+  resultCount?: number;
+  sourceCount?: number;
+  sources: Array<{ title?: string; url?: string }>;
+}): string {
+  const sources = input.sources.filter((source) => source.url).slice(0, 8);
+  return [
+    "━━━━━━━━━━━━━━",
+    "🔎 گزارش جستجو",
+    `نوع جستجو: ${input.type}`,
+    "Provider: Tavily",
+    input.depth ? `عمق جستجو: ${input.depth === "advanced" ? "Advanced" : "Basic"}` : "",
+    input.model ? `مدل تحقیق: ${input.model}` : "",
+    input.resultCount !== undefined ? `تعداد نتایج: ${input.resultCount}` : "",
+    input.sourceCount !== undefined ? `تعداد منابع: ${input.sourceCount}` : "",
+    sources.length ? "منابع واقعی استفاده‌شده:" : "منبع URL قابل نمایش دریافت نشد",
+    ...sources.map((source, index) => `${index + 1}. ${source.title || "Source"}\n${source.url}`),
+    "━━━━━━━━━━━━━━"
+  ].filter(Boolean).join("\n");
+}
+
 function formatSearchResults(query: string, response: {
   results?: TavilySearchResult[];
   request_id?: string;
   usage?: TavilyUsage;
-}): string {
+}, depth: SearchDepth): string {
   const results = response.results ?? [];
+  const report = formatWebSearchReport({
+    type: "Web Search",
+    depth,
+    resultCount: results.length,
+    sources: results.map((result) => ({ title: result.title, url: result.url }))
+  });
   return [
     "TAVILY SEARCH RESULT",
     `QUERY: ${query}`,
-    `SEARCH DEPTH: ${isCurrentOrRecommendationQuery(query) ? "advanced" : "basic"}`,
+    `SEARCH DEPTH: ${depth}`,
     response.request_id ? `REQUEST ID: ${response.request_id}` : "",
     response.usage?.credits !== undefined ? `TAVILY CREDITS USED: ${response.usage.credits}` : "",
     `RESULT COUNT: ${results.length}`,
@@ -86,7 +116,10 @@ function formatSearchResults(query: string, response: {
       `URL: ${result.url || ""}`,
       result.publishedDate ? `PUBLISHED: ${result.publishedDate}` : "",
       result.content ? `CONTENT: ${cleanText(result.content, 6000)}` : ""
-    ].filter(Boolean).join("\n"))
+    ].filter(Boolean).join("\n")),
+    "",
+    "MANDATORY FINAL SEARCH REPORT (COPY THIS BLOCK VERBATIM AT THE END OF THE USER-FACING ANSWER):",
+    report
   ].filter(Boolean).join("\n\n");
 }
 
@@ -110,7 +143,7 @@ async function tavilySearch(
     include_raw_content: false,
     ...(depth === "advanced" ? { chunks_per_source: 2 } : {})
   });
-  return formatSearchResults(query, response);
+  return formatSearchResults(query, response, depth);
 }
 
 function researchContentText(content: unknown): string {
@@ -133,6 +166,14 @@ function formatResearchResult(query: string, model: ResearchModel, result: {
     `STATUS: ${result.status || "completed"}`,
     result.request_id ? `REQUEST ID: ${result.request_id}` : "",
     `SOURCE COUNT: ${sources.length}`,
+    "",
+    "MANDATORY FINAL SEARCH REPORT (COPY THIS BLOCK VERBATIM AT THE END OF THE USER-FACING ANSWER):",
+    formatWebSearchReport({
+      type: "Deep Research",
+      model,
+      sourceCount: sources.length,
+      sources: sources.map((source) => ({ title: source.title, url: source.url }))
+    }),
     "",
     "RESEARCH REPORT",
     researchContentText(result.content),
@@ -202,6 +243,13 @@ async function tavilyExtract(env: Env, urls: string[]): Promise<string> {
     `FAILED: ${failed.length}`,
     response.usage?.credits !== undefined ? `TAVILY CREDITS USED: ${response.usage.credits}` : "",
     "",
+    "MANDATORY FINAL SEARCH REPORT (COPY THIS BLOCK VERBATIM AT THE END OF THE USER-FACING ANSWER):",
+    formatWebSearchReport({
+      type: "URL Extraction",
+      sourceCount: successful.length,
+      sources: successful.map((item) => ({ title: "Extracted page", url: item.url }))
+    }),
+    "",
     ...successful.map((item, index) => `${index + 1}. URL: ${item.url || ""}\nCONTENT:\n${cleanText(item.raw_content || "", 10000)}`),
     failed.length ? `FAILED URLS:\n${failed.map((item) => `${item.url || "unknown"}: ${item.error || "unknown error"}`).join("\n")}` : ""
   ].filter(Boolean).join("\n\n");
@@ -230,7 +278,7 @@ export class ConversationAgent extends Think {
       "Do not claim that a search or research was performed unless the tool result confirms it.",
       "Never invent sources, URLs, dates, versions, rankings, or current facts.",
       "When using web research, base factual claims on the returned research/search context. If sources disagree or evidence is weak, say so.",
-      "After web research, finish with a compact 'گزارش جستجو' stating the actual provider (Tavily), the number of sources/results when available, and the most relevant source URLs.",
+      "After web research, finish with the exact MANDATORY FINAL SEARCH REPORT block supplied by the tool. Do not modify, omit, or invent any provider, count, or URL in that block.",
       "Never reveal API keys, environment secrets, hidden reasoning, or hidden tool internals.",
       "For Cloudflare questions, prefer official Cloudflare and official npm sources when search results provide them.",
       "Use fetch_to_markdown or browse only when you need a specific URL rendered/read through Cloudflare Browser Run.",
@@ -283,15 +331,25 @@ export class ConversationAgent extends Think {
     });
 
     const fetchToMarkdown = tool({
-      description: "Fetch a public URL through Cloudflare Browser Run and return clean Markdown. Use this only when a specific URL needs rendered page inspection.",
-      inputSchema: jsonSchema<{ url: string }>({ type: "object", properties: { url: { type: "string", description: "Public URL to fetch" } }, required: ["url"], additionalProperties: false }),
-      execute: async ({ url }) => browserMarkdown(this.env.BROWSER, { url })
+      description: "Fetch a public URL through Cloudflare Browser Run and return cleaned Markdown/text. Use when the user gives a URL or when you need a page's rendered content.",
+      inputSchema: jsonSchema<{ url: string }>({
+        type: "object",
+        properties: { url: { type: "string" } },
+        required: ["url"],
+        additionalProperties: false
+      }),
+      execute: async ({ url }) => browserMarkdown(this.env.BROWSER, url)
     });
 
     const browse = tool({
-      description: "Open a public URL in Cloudflare Browser Run and return rendered HTML. Use only when page rendering or JavaScript is needed.",
-      inputSchema: jsonSchema<{ url: string }>({ type: "object", properties: { url: { type: "string", description: "Public URL to browse" } }, required: ["url"], additionalProperties: false }),
-      execute: async ({ url }) => browserContent(this.env.BROWSER, { url })
+      description: "Read a public URL as cleaned browser content. Use for specific pages when needed.",
+      inputSchema: jsonSchema<{ url: string }>({
+        type: "object",
+        properties: { url: { type: "string" } },
+        required: ["url"],
+        additionalProperties: false
+      }),
+      execute: async ({ url }) => browserContent(this.env.BROWSER, url)
     });
 
     return {
@@ -304,29 +362,25 @@ export class ConversationAgent extends Think {
   }
 
   override async beforeTurn(ctx: TurnContext): Promise<TurnConfig | void> {
-  if (ctx.continuation) return;
+    if (ctx.continuation) return;
 
-  const latestUserMessage = [...ctx.messages]
-    .reverse()
-    .map(messageText)
-    .find(Boolean);
-  const explicitSearchQuery = latestUserMessage
-    ? extractExplicitSearchQuery(latestUserMessage)
-    : null;
+    const latestUserMessage = [...ctx.messages]
+      .reverse()
+      .map(messageText)
+      .find(Boolean);
+    const explicitSearchQuery = latestUserMessage
+      ? extractExplicitSearchQuery(latestUserMessage)
+      : null;
 
-  if (!explicitSearchQuery) return;
+    if (!explicitSearchQuery) return;
 
-  const directSearchResult = await tavilySearch(this.env, explicitSearchQuery, {
-    depth: "advanced",
-    maxResults: 8
-  });
+    const directSearchResult = await tavilySearch(this.env, explicitSearchQuery, {
+      depth: "advanced",
+      maxResults: 8
+    });
 
-  return {
-    system: `${ctx.system}\n\n[MANDATORY DIRECT TAVILY SEARCH RESULT]\n${directSearchResult}\n\nThe web search above was executed directly by the server. Treat it as authoritative web-search context for this user request. Do not claim that no web-search tool is available. Do not repeat the search unless the user explicitly asks for another search. Base current factual claims on these results and include the most relevant URLs.`
-  };
-}
-
-  async resetConversation(): Promise<void> {
-    await this.clearMessages();
+    return {
+      system: `${ctx.system}\n\n[MANDATORY DIRECT TAVILY SEARCH RESULT]\n${directSearchResult}\n\nThe web search above was executed directly by the server. Treat it as authoritative web-search context for this user request. Do not claim that no web-search tool is available. Do not repeat the search unless the user explicitly asks for another search. Base current factual claims on these results and include the most relevant URLs.`
+    };
   }
 }
