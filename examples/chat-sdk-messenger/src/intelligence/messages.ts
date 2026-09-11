@@ -3,6 +3,7 @@ import type { UIMessage } from "ai";
 
 const ASK_COMMAND = /^\/ask(?:@\w+)?(?:\s+|$)/i;
 const MENU_COMMAND = /^\/menu(?:@\w+)?(?:\s|$)/i;
+const SEARCH_COMMAND = /^\/search(?:@\w+)?(?:\s|$)/i;
 const RESET_COMMAND = /^\/reset(?:@\w+)?(?:\s|$)/i;
 
 export interface AiRoutingInput {
@@ -23,12 +24,16 @@ export function isMenuCommand(text: string): boolean {
   return MENU_COMMAND.test(text.trim());
 }
 
+export function isSearchCommand(text: string): boolean {
+  return SEARCH_COMMAND.test(text.trim());
+}
+
 export function isResetCommand(text: string): boolean {
   return RESET_COMMAND.test(text.trim());
 }
 
 export function shouldRouteToAi(input: AiRoutingInput): boolean {
-  if (isMenuCommand(input.text) || isResetCommand(input.text)) {
+  if (isMenuCommand(input.text) || isSearchCommand(input.text) || isResetCommand(input.text)) {
     return false;
   }
 
@@ -45,9 +50,6 @@ export async function toThinkUserMessage(message: Message): Promise<UIMessage> {
     message.author.fullName || message.author.userName || message.author.userId;
   const content = authorName ? `${authorName}: ${text}` : text;
 
-  // Web research is handled centrally by ConversationAgent.beforeTurn().
-  // Do not search here: doing so duplicates the request and can corrupt
-  // the durable Think turn/message lifecycle.
   return {
     id: `telegram:${message.id}`,
     role: "user",
