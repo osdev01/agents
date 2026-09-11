@@ -1,5 +1,5 @@
 import { createOpenAI } from "@ai-sdk/openai";
-import { Think, type TurnContext, type TurnConfig } from "@cloudflare/think";
+import { Think, type ChatResponseResult, type TurnContext, type TurnConfig } from "@cloudflare/think";
 import { browserContent, browserMarkdown } from "agents/browser";
 import { tool, jsonSchema, type ToolSet } from "ai";
 
@@ -16,6 +16,17 @@ type TavilySearchResult = {
 };
 
 type TavilyUsage = { credits?: number };
+
+type TavilyReport = {
+  type: string;
+  depth?: SearchDepth;
+  model?: ResearchModel;
+  requestId?: string;
+  creditsUsed?: number;
+  resultCount?: number;
+  sourceCount?: number;
+  sources: Array<{ title?: string; url?: string }>;
+};
 
 function cleanText(value: string, max = 12000): string {
   return value.replace(/\s+/g, " ").trim().slice(0, max);
@@ -67,25 +78,20 @@ async function tavilyRequest<T>(env: Env, path: string, body?: unknown, method: 
   return await response.json() as T;
 }
 
-function formatWebSearchReport(input: {
-  type: string;
-  depth?: string;
-  model?: string;
-  resultCount?: number;
-  sourceCount?: number;
-  sources: Array<{ title?: string; url?: string }>;
-}): string {
+function formatWebSearchReport(input: TavilyReport): string {
   const sources = input.sources.filter((source) => source.url).slice(0, 8);
   return [
     "━━━━━━━━━━━━━━",
-    "🔎 گزارش جستجو",
+    "🔎 گزارش جستجوی واقعی Tavily",
     `نوع جستجو: ${input.type}`,
     "Provider: Tavily",
     input.depth ? `عمق جستجو: ${input.depth === "advanced" ? "Advanced" : "Basic"}` : "",
     input.model ? `مدل تحقیق: ${input.model}` : "",
+    input.requestId ? `Request ID واقعی Tavily: ${input.requestId}` : "Request ID: دریافت نشد",
+    input.creditsUsed !== undefined ? `Credits مصرف‌شده طبق پاسخ Tavily: ${input.creditsUsed}` : "Credits: در پاسخ Tavily گزارش نشد",
     input.resultCount !== undefined ? `تعداد نتایج: ${input.resultCount}` : "",
     input.sourceCount !== undefined ? `تعداد منابع: ${input.sourceCount}` : "",
-    sources.length ? "منابع واقعی استفاده‌شده:" : "منبع URL قابل نمایش دریافت نشد",
+    sources.length ? "منابع واقعی برگشتی از Tavily:" : "منبع URL قابل نمایش دریافت نشد",
     ...sources.map((source, index) => `${index + 1}. ${source.title || "Source"}\n${source.url}`),
     "━━━━━━━━━━━━━━"
   ].filter(Boolean).join("\n");
@@ -95,20 +101,24 @@ function formatSearchResults(query: string, response: {
   results?: TavilySearchResult[];
   request_id?: string;
   usage?: TavilyUsage;
-}, depth: SearchDepth): string {
+}, depth: SearchDepth): { context: string; report: string } {
   const results = response.results ?? [];
   const report = formatWebSearchReport({
     type: "Web Search",
     depth,
+    requestId: response.request_id,
+    creditsUsed: response.usage?.credits,
     resultCount: results.length,
+    sourceCount: results.length,
     sources: results.map((result) => ({ title: result.title, url: result.url }))
   });
-  return [
+
+  const context = [
     "TAVILY SEARCH RESULT",
     `QUERY: ${query}`,
     `SEARCH DEPTH: ${depth}`,
-    response.request_id ? `REQUEST ID: ${response.request_id}` : "",
-    response.usage?.credits !== undefined ? `TAVILY CREDITS USED: ${response.usage.credits}` : "",
+    response.request_id ? `REQUEST ID: ${response.request_id}` : "REQUEST ID: MISSING",
+    response.usage?.credits !== undefined ? `TAVILY CREDITS USED: ${response.usage.credits}` : "TAVILY CREDITS USED: MISSING",
     `RESULT COUNT: ${results.length}`,
     "",
     ...results.map((result, index) => [
@@ -116,18 +126,17 @@ function formatSearchResults(query: string, response: {
       `URL: ${result.url || ""}`,
       result.publishedDate ? `PUBLISHED: ${result.publishedDate}` : "",
       result.content ? `CONTENT: ${cleanText(result.content, 6000)}` : ""
-    ].filter(Boolean).join("\n")),
-    "",
-    "MANDATORY FINAL SEARCH REPORT (COPY THIS BLOCK VERBATIM AT THE END OF THE USER-FACING ANSWER):",
-    report
+    ].filter(Boolean).join("\n"))
   ].filter(Boolean).join("\n\n");
+
+  return { context, report };
 }
 
 async function tavilySearch(
   env: Env,
   query: string,
   options: { depth?: SearchDepth; topic?: SearchTopic; maxResults?: number } = {}
-): Promise<string> {
+): Promise<{ context: string; report: string }> {
   const depth = options.depth ?? (isCurrentOrRecommendationQuery(query) ? "advanced" : "basic");
   const maxResults = Math.min(Math.max(options.maxResults ?? 6, 1), 10);
   const response = await tavilyRequest<{
@@ -157,23 +166,22 @@ function formatResearchResult(query: string, model: ResearchModel, result: {
   content?: unknown;
   sources?: Array<{ title?: string; url?: string; snippet?: string }>;
   request_id?: string;
-}): string {
+}): { context: string; report: string } {
   const sources = result.sources ?? [];
-  return [
+  const report = formatWebSearchReport({
+    type: "Deep Research",
+    model,
+    requestId: result.request_id,
+    sourceCount: sources.length,
+    sources: sources.map((source) => ({ title: source.title, url: source.url }))
+  });
+  const context = [
     "TAVILY DEEP RESEARCH REPORT",
     `QUERY: ${query}`,
     `MODEL: ${model}`,
     `STATUS: ${result.status || "completed"}`,
-    result.request_id ? `REQUEST ID: ${result.request_id}` : "",
+    result.request_id ? `REQUEST ID: ${result.request_id}` : "REQUEST ID: MISSING",
     `SOURCE COUNT: ${sources.length}`,
-    "",
-    "MANDATORY FINAL SEARCH REPORT (COPY THIS BLOCK VERBATIM AT THE END OF THE USER-FACING ANSWER):",
-    formatWebSearchReport({
-      type: "Deep Research",
-      model,
-      sourceCount: sources.length,
-      sources: sources.map((source) => ({ title: source.title, url: source.url }))
-    }),
     "",
     "RESEARCH REPORT",
     researchContentText(result.content),
@@ -181,11 +189,12 @@ function formatResearchResult(query: string, model: ResearchModel, result: {
     "SOURCES",
     ...sources.slice(0, 20).map((source, index) => `${index + 1}. ${source.title || source.url || "Source"}\nURL: ${source.url || ""}`),
     "",
-    "STRICT REPORTING RULE: Treat this report and its sources as the factual research context. Do not invent current facts that are not supported by the report. In the final answer, summarize supported findings, preserve important uncertainty, and include the most relevant source URLs. Do not reveal API keys or hidden tool internals."
+    "Do not invent current facts, URLs, dates, rankings, or source metadata not present in this report."
   ].filter(Boolean).join("\n\n");
+  return { context, report };
 }
 
-async function tavilyResearch(env: Env, query: string, model: ResearchModel = "mini"): Promise<string> {
+async function tavilyResearch(env: Env, query: string, model: ResearchModel = "mini"): Promise<{ context: string; report: string }> {
   const response = await tavilyRequest<{ request_id?: string }>(env, "/research", {
     input: query,
     model,
@@ -224,38 +233,39 @@ async function tavilyResearch(env: Env, query: string, model: ResearchModel = "m
   throw new Error("Tavily Research timed out while waiting for the research report");
 }
 
-async function tavilyExtract(env: Env, urls: string[]): Promise<string> {
+async function tavilyExtract(env: Env, urls: string[]): Promise<{ context: string; report: string }> {
   const limitedUrls = urls.filter((url) => /^https?:\/\//i.test(url)).slice(0, 20);
   if (!limitedUrls.length) throw new Error("Provide at least one valid HTTP(S) URL");
   const response = await tavilyRequest<{
     results?: Array<{ url?: string; raw_content?: string }>;
     failed_results?: Array<{ url?: string; error?: string }>;
     usage?: TavilyUsage;
-  }>(env, "/extract", {
-    urls: limitedUrls
-  });
+  }>(env, "/extract", { urls: limitedUrls });
   const successful = response.results ?? [];
   const failed = response.failed_results ?? [];
-  return [
+  const report = formatWebSearchReport({
+    type: "URL Extraction",
+    requestId: undefined,
+    creditsUsed: response.usage?.credits,
+    sourceCount: successful.length,
+    sources: successful.map((item) => ({ title: "Extracted page", url: item.url }))
+  });
+  const context = [
     "TAVILY EXTRACT RESULT",
     `REQUESTED URLS: ${limitedUrls.length}`,
     `SUCCESSFUL: ${successful.length}`,
     `FAILED: ${failed.length}`,
     response.usage?.credits !== undefined ? `TAVILY CREDITS USED: ${response.usage.credits}` : "",
     "",
-    "MANDATORY FINAL SEARCH REPORT (COPY THIS BLOCK VERBATIM AT THE END OF THE USER-FACING ANSWER):",
-    formatWebSearchReport({
-      type: "URL Extraction",
-      sourceCount: successful.length,
-      sources: successful.map((item) => ({ title: "Extracted page", url: item.url }))
-    }),
-    "",
     ...successful.map((item, index) => `${index + 1}. URL: ${item.url || ""}\nCONTENT:\n${cleanText(item.raw_content || "", 10000)}`),
     failed.length ? `FAILED URLS:\n${failed.map((item) => `${item.url || "unknown"}: ${item.error || "unknown error"}`).join("\n")}` : ""
   ].filter(Boolean).join("\n\n");
+  return { context, report };
 }
 
 export class ConversationAgent extends Think {
+  private pendingTavilyReport: string | null = null;
+
   override getModel() {
     const provider = createOpenAI({ apiKey: this.env.BAI_API_KEY, baseURL: this.env.BAI_BASE_URL });
     return provider("laguna-s-2.1");
@@ -276,9 +286,8 @@ export class ConversationAgent extends Think {
       "Use tavily_search for quick current lookups and focused source discovery. Basic is cheaper; advanced is better for current/recommendation questions.",
       "Use tavily_extract when you need the actual contents of one or more specific URLs returned by search or supplied by the user.",
       "Do not claim that a search or research was performed unless the tool result confirms it.",
-      "Never invent sources, URLs, dates, versions, rankings, or current facts.",
-      "When using web research, base factual claims on the returned research/search context. If sources disagree or evidence is weak, say so.",
-      "After web research, finish with the exact MANDATORY FINAL SEARCH REPORT block supplied by the tool. Do not modify, omit, or invent any provider, count, or URL in that block.",
+      "Never invent sources, URLs, dates, versions, rankings, request IDs, credit usage, or current facts.",
+      "The final Tavily report is appended by the server from the actual Tavily response. Do not create or rewrite that report yourself.",
       "Never reveal API keys, environment secrets, hidden reasoning, or hidden tool internals.",
       "For Cloudflare questions, prefer official Cloudflare and official npm sources when search results provide them.",
       "Use fetch_to_markdown or browse only when you need a specific URL rendered/read through Cloudflare Browser Run.",
@@ -288,50 +297,60 @@ export class ConversationAgent extends Think {
 
   override getTools(): ToolSet {
     const tavilySearchTool = tool({
-      description: "Official Tavily web search. REQUIRED for explicit web-search requests and for current/latest/2026/best/top/recommendation/comparison/news/price/version questions. Automatically prefer advanced search for time-sensitive or recommendation queries. Returns ranked sources and URLs. Do not answer from memory after calling this tool.",
+      description: "Official Tavily web search. REQUIRED for explicit web-search requests and for current/latest/2026/best/top/recommendation/comparison/news/price/version questions. Returns ranked sources and URLs.",
       inputSchema: jsonSchema<{ query: string; depth?: SearchDepth; topic?: SearchTopic; maxResults?: number }>({
         type: "object",
         properties: {
           query: { type: "string", description: "Focused web search query; include the relevant year such as 2026 when the user asks for current information." },
-          depth: { type: "string", enum: ["basic", "advanced"], description: "Basic is cheaper; advanced is preferred for current, best, comparison, news, prices, versions, and recommendation queries." },
-          topic: { type: "string", enum: ["general", "news", "finance"], description: "Search topic." },
+          depth: { type: "string", enum: ["basic", "advanced"] },
+          topic: { type: "string", enum: ["general", "news", "finance"] },
           maxResults: { type: "number", description: "Maximum results, 1 to 10." }
         },
         required: ["query"],
         additionalProperties: false
       }),
-      execute: async ({ query, depth, topic, maxResults }) => tavilySearch(this.env, query, { depth, topic, maxResults })
+      execute: async ({ query, depth, topic, maxResults }) => {
+        const result = await tavilySearch(this.env, query, { depth, topic, maxResults });
+        this.pendingTavilyReport = result.report;
+        return result.context;
+      }
     });
 
     const tavilyResearchTool = tool({
-      description: "Official Tavily Deep Research. Use for deep research, multi-source fact checking, comparisons, rankings, best-of questions, or when the user explicitly asks for deep/comprehensive research. Tavily gathers and analyzes sources and returns a research report with citations. Default to mini to conserve credits; use pro only for genuinely complex research.",
+      description: "Official Tavily Deep Research. Use for deep research, multi-source fact checking, comparisons, rankings, best-of questions, or explicit comprehensive research. Default to mini to conserve credits.",
       inputSchema: jsonSchema<{ query: string; model?: ResearchModel }>({
         type: "object",
         properties: {
           query: { type: "string", description: "Precise research question. Include the current year when relevant." },
-          model: { type: "string", enum: ["auto", "mini", "pro"], description: "Research model. Mini is the normal default; pro is for complex research." }
+          model: { type: "string", enum: ["auto", "mini", "pro"] }
         },
         required: ["query"],
         additionalProperties: false
       }),
-      execute: async ({ query, model }) => tavilyResearch(this.env, query, model ?? "mini")
+      execute: async ({ query, model }) => {
+        const result = await tavilyResearch(this.env, query, model ?? "mini");
+        this.pendingTavilyReport = result.report;
+        return result.context;
+      }
     });
 
     const tavilyExtractTool = tool({
-      description: "Extract the readable/raw content from up to 20 specific public URLs using Tavily. Use after search when the exact page content matters.",
+      description: "Extract readable/raw content from up to 20 specific public URLs using Tavily.",
       inputSchema: jsonSchema<{ urls: string[] }>({
         type: "object",
-        properties: {
-          urls: { type: "array", items: { type: "string" }, description: "Public HTTP(S) URLs to extract, up to 20." }
-        },
+        properties: { urls: { type: "array", items: { type: "string" } } },
         required: ["urls"],
         additionalProperties: false
       }),
-      execute: async ({ urls }) => tavilyExtract(this.env, urls)
+      execute: async ({ urls }) => {
+        const result = await tavilyExtract(this.env, urls);
+        this.pendingTavilyReport = result.report;
+        return result.context;
+      }
     });
 
     const fetchToMarkdown = tool({
-      description: "Fetch a public URL through Cloudflare Browser Run and return cleaned Markdown/text. Use when the user gives a URL or when you need a page's rendered content.",
+      description: "Fetch a public URL through Cloudflare Browser Run and return cleaned Markdown/text.",
       inputSchema: jsonSchema<{ url: string }>({
         type: "object",
         properties: { url: { type: "string" } },
@@ -342,7 +361,7 @@ export class ConversationAgent extends Think {
     });
 
     const browse = tool({
-      description: "Read a public URL as cleaned browser content. Use for specific pages when needed.",
+      description: "Read a public URL as cleaned browser content.",
       inputSchema: jsonSchema<{ url: string }>({
         type: "object",
         properties: { url: { type: "string" } },
@@ -364,6 +383,7 @@ export class ConversationAgent extends Think {
   override async beforeTurn(ctx: TurnContext): Promise<TurnConfig | void> {
     if (ctx.continuation) return;
 
+    this.pendingTavilyReport = null;
     const latestUserMessage = [...ctx.messages]
       .reverse()
       .map(messageText)
@@ -378,9 +398,33 @@ export class ConversationAgent extends Think {
       depth: "advanced",
       maxResults: 8
     });
+    this.pendingTavilyReport = directSearchResult.report;
 
     return {
-      system: `${ctx.system}\n\n[MANDATORY DIRECT TAVILY SEARCH RESULT]\n${directSearchResult}\n\nThe web search above was executed directly by the server. Treat it as authoritative web-search context for this user request. Do not claim that no web-search tool is available. Do not repeat the search unless the user explicitly asks for another search. Base current factual claims on these results and include the most relevant URLs.`
+      system: `${ctx.system}\n\n[SERVER-EXECUTED TAVILY SEARCH CONTEXT]\n${directSearchResult.context}\n\nThe web search above was executed directly by the server. Treat it as authoritative web-search context for this user request. Do not claim that no web-search tool is available. Do not invent or rewrite request IDs, credits, source URLs, dates, or other search metadata.`
     };
+  }
+
+  override async onChatResponse(result: ChatResponseResult): Promise<void> {
+    if (result.status !== "completed" || !this.pendingTavilyReport || !result.message?.id) return;
+
+    const report = this.pendingTavilyReport;
+    this.pendingTavilyReport = null;
+
+    const currentParts = Array.isArray(result.message.parts) ? result.message.parts : [];
+    const hasReport = currentParts.some((part) =>
+      part && typeof part === "object" && "text" in part && typeof (part as { text?: unknown }).text === "string" && (part as { text: string }).text.includes("🔎 گزارش جستجوی واقعی Tavily")
+    );
+    if (hasReport) return;
+
+    await this.addMessages([
+      {
+        ...result.message,
+        parts: [
+          ...currentParts,
+          { type: "text", text: `\n\n${report}` }
+        ]
+      }
+    ], { mode: "upsert" });
   }
 }
