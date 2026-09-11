@@ -13,12 +13,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Skip generated patch commit
-        if: startsWith(github.event.head_commit.message, 'chore: apply direct Tavily search')
-        run: echo "Patch already applied; nothing to do."
-
       - name: Patch ConversationAgent
-        if: ${{ !startsWith(github.event.head_commit.message, 'chore: apply direct Tavily search') }}
         env:
           TARGET: examples/chat-sdk-messenger/src/intelligence/conversation-agent.ts
         run: |
@@ -85,14 +80,12 @@ jobs:
           PY
 
       - name: Verify patch
-        if: ${{ !startsWith(github.event.head_commit.message, 'chore: apply direct Tavily search') }}
         run: |
           grep -n "MANDATORY DIRECT TAVILY SEARCH RESULT" examples/chat-sdk-messenger/src/intelligence/conversation-agent.ts
           grep -n "async beforeTurn" examples/chat-sdk-messenger/src/intelligence/conversation-agent.ts
           git diff --check
 
       - name: Commit patch and remove temporary workflow
-        if: ${{ !startsWith(github.event.head_commit.message, 'chore: apply direct Tavily search') }}
         run: |
           rm -f .github/workflows/patch-direct-tavily.yml
           git config user.name "github-actions[bot]"
