@@ -1,0 +1,153 @@
+name: Add search report
+
+on:
+  workflow_dispatch:
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Patch conversation agent
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('examples/chat-sdk-messenger/src/intelligence/conversation-agent.ts')
+          s = p.read_text()
+          old = '''function formatSearchResults(query: string, response: {
+  results?: TavilySearchResult[];
+  request_id?: string;
+  usage?: TavilyUsage;
+}): string {
+  const results = response.results ?? [];
+  return [
+    "TAVILY SEARCH RESULT",
+    `QUERY: ${query}`,
+    `SEARCH DEPTH: ${isCurrentOrRecommendationQuery(query) ? "advanced" : "basic"}`,
+    response.request_id ? `REQUEST ID: ${response.request_id}` : "",
+    response.usage?.credits !== undefined ? `TAVILY CREDITS USED: ${response.usage.credits}` : "",
+    `RESULT COUNT: ${results.length}`,
+    "",
+    ...results.map((result, index) => [
+      `${index + 1}. ${result.title || result.url || "Untitled result"}`,
+      `URL: ${result.url || ""}`,
+      result.publishedDate ? `PUBLISHED: ${result.publishedDate}` : "",
+      result.content ? `CONTENT: ${cleanText(result.content, 6000)}` : ""
+    ].filter(Boolean).join("\\n"))
+  ].filter(Boolean).join("\\n\\n");
+}
+'''
+          new = '''function formatSearchResults(query: string, response: {
+  results?: TavilySearchResult[];
+  request_id?: string;
+  usage?: TavilyUsage;
+}, depth: SearchDepth): string {
+  const results = response.results ?? [];
+  const report = formatWebSearchReport({
+    type: "Web Search",
+    depth,
+    resultCount: results.length,
+    sources: results.map((result) => ({ title: result.title, url: result.url }))
+  });
+  return [
+    "TAVILY SEARCH RESULT",
+    `QUERY: ${query}`,
+    `SEARCH DEPTH: ${depth}`,
+    response.request_id ? `REQUEST ID: ${response.request_id}` : "",
+    response.usage?.credits !== undefined ? `TAVILY CREDITS USED: ${response.usage.credits}` : "",
+    `RESULT COUNT: ${results.length}`,
+    "",
+    ...results.map((result, index) => [
+      `${index + 1}. ${result.title || result.url || "Untitled result"}`,
+      `URL: ${result.url || ""}`,
+      result.publishedDate ? `PUBLISHED: ${result.publishedDate}` : "",
+      result.content ? `CONTENT: ${cleanText(result.content, 6000)}` : ""
+    ].filter(Boolean).join("\\n")),
+    "",
+    "MANDATORY FINAL SEARCH REPORT (COPY THIS BLOCK VERBATIM AT THE END OF THE USER-FACING ANSWER):",
+    report
+  ].filter(Boolean).join("\\n\\n");
+}
+
+function formatWebSearchReport(input: {
+  type: string;
+  depth?: string;
+  model?: string;
+  resultCount?: number;
+  sourceCount?: number;
+  sources: Array<{ title?: string; url?: string }>;
+}): string {
+  const sources = input.sources.filter((source) => source.url).slice(0, 8);
+  return [
+    "━━━━━━━━━━━━━━",
+    "🔎 گزارش جستجو",
+    `نوع جستجو: ${input.type}`,
+    "Provider: Tavily",
+    input.depth ? `عمق جستجو: ${input.depth === "advanced" ? "Advanced" : "Basic"}` : "",
+    input.model ? `مدل تحقیق: ${input.model}` : "",
+    input.resultCount !== undefined ? `تعداد نتایج: ${input.resultCount}` : "",
+    input.sourceCount !== undefined ? `تعداد منابع: ${input.sourceCount}` : "",
+    sources.length ? "منابع واقعی استفاده‌شده:" : "منبع URL قابل نمایش دریافت نشد",
+    ...sources.map((source, index) => `${index + 1}. ${source.title || "Source"}\\n${source.url}`),
+    "━━━━━━━━━━━━━━"
+  ].filter(Boolean).join("\\n");
+}
+'''
+          if old not in s:
+              raise SystemExit('formatSearchResults target not found')
+          s = s.replace(old, new, 1)
+          old2 = '''  return formatSearchResults(query, response);'''
+          new2 = '''  return formatSearchResults(query, response, depth);'''
+          if old2 not in s:
+              raise SystemExit('tavilySearch return target not found')
+          s = s.replace(old2, new2, 1)
+          old3 = '''    `SOURCE COUNT: ${sources.length}`,
+    "",
+    "RESEARCH REPORT",'''
+          new3 = '''    `SOURCE COUNT: ${sources.length}`,
+    "",
+    "MANDATORY FINAL SEARCH REPORT (COPY THIS BLOCK VERBATIM AT THE END OF THE USER-FACING ANSWER):",
+    formatWebSearchReport({
+      type: "Deep Research",
+      model,
+      sourceCount: sources.length,
+      sources: sources.map((source) => ({ title: source.title, url: source.url }))
+    }),
+    "",
+    "RESEARCH REPORT",'''
+          if old3 not in s:
+              raise SystemExit('research report target not found')
+          s = s.replace(old3, new3, 1)
+          old4 = '''    `FAILED: ${failed.length}`,
+    response.usage?.credits !== undefined ? `TAVILY CREDITS USED: ${response.usage.credits}` : "",
+    "",'''
+          new4 = '''    `FAILED: ${failed.length}`,
+    response.usage?.credits !== undefined ? `TAVILY CREDITS USED: ${response.usage.credits}` : "",
+    "",
+    "MANDATORY FINAL SEARCH REPORT (COPY THIS BLOCK VERBATIM AT THE END OF THE USER-FACING ANSWER):",
+    formatWebSearchReport({
+      type: "URL Extraction",
+      sourceCount: successful.length,
+      sources: successful.map((item) => ({ title: "Extracted page", url: item.url }))
+    }),
+    "",'''
+          if old4 not in s:
+              raise SystemExit('extract report target not found')
+          s = s.replace(old4, new4, 1)
+          p.write_text(s)
+          PY
+          git config user.name github-actions
+          git config user.email github-actions@github.com
+          git add examples/chat-sdk-messenger/src/intelligence/conversation-agent.ts
+          git commit -m "feat: append factual Tavily search report"
+          git push
+      - name: Remove patch workflow
+        if: always()
+        shell: bash
+        run: |
+          git rm .github/workflows/patch-search-report.yml || true
+          git commit -m "chore: remove temporary patch workflow" || true
+          git push || true
