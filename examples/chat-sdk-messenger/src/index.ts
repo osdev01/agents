@@ -71,6 +71,7 @@ export type { AiReplySnapshot } from "./intelligence/delivery";
 export type { TelegramWebhookSetupResult } from "./provider/telegram";
 
 const DEFAULT_AGENT_NAME = "default";
+const TELEGRAM_COMMAND_PATTERN = /^\/(?:menu|reset)(?:@\w+)?(?:\s|$)/i;
 
 function toError(error: unknown): Error {
   return error instanceof Error ? error : new Error(String(error));
@@ -86,6 +87,70 @@ function setupErrorResponse(error: Error): Response {
       }
     }
   );
+}
+
+/**
+ * Telegram marks `/menu` and `/reset` with a `bot_command` entity. The current
+ * Telegram Chat SDK adapter intentionally does not advertise slash-command
+ * support, so those updates can be dropped before normal DM/message handlers
+ * run. Strip only the command entity and let the exact same text continue
+ * through Chat SDK's ordinary message pipeline, where our existing
+ * isMenuCommand/isResetCommand routing handles it.
+ */
+async function normalizeTelegramCommandWebhook(
+  request: Request
+): Promise<Request> {
+  if (request.method !== "POST") {
+    return request;
+  }
+
+  let payload: Record<string, any>;
+  try {
+    payload = (await request.clone().json()) as Record<string, any>;
+  } catch {
+    return request;
+  }
+
+  const message =
+    payload.message ??
+    payload.edited_message ??
+    payload.channel_post ??
+    payload.edited_channel_post;
+  if (!message || typeof message !== "object") {
+    return request;
+  }
+
+  const text =
+    typeof message.text === "string"
+      ? message.text
+      : typeof message.caption === "string"
+        ? message.caption
+        : "";
+  if (!TELEGRAM_COMMAND_PATTERN.test(text.trim())) {
+    return request;
+  }
+
+  const normalized = JSON.parse(JSON.stringify(payload)) as Record<string, any>;
+  const normalizedMessage =
+    normalized.message ??
+    normalized.edited_message ??
+    normalized.channel_post ??
+    normalized.edited_channel_post;
+
+  if (Array.isArray(normalizedMessage.entities)) {
+    normalizedMessage.entities = normalizedMessage.entities.filter(
+      (entity: { type?: string }) => entity.type !== "bot_command"
+    );
+  }
+  if (Array.isArray(normalizedMessage.caption_entities)) {
+    normalizedMessage.caption_entities = normalizedMessage.caption_entities.filter(
+      (entity: { type?: string }) => entity.type !== "bot_command"
+    );
+  }
+
+  return new Request(request, {
+    body: JSON.stringify(normalized)
+  });
 }
 
 export function getIngressAgentName(_request: Request): string {
@@ -361,7 +426,8 @@ export class ChatIngressAgent extends Agent {
       return setupErrorResponse(bot);
     }
 
-    return bot.webhooks.telegram(request, {
+    const telegramRequest = await normalizeTelegramCommandWebhook(request);
+    return bot.webhooks.telegram(telegramRequest, {
       waitUntil: (task: Promise<unknown>) => this.ctx.waitUntil(task)
     });
   }
@@ -582,8 +648,8 @@ function setupResponse(request: Request, env: Cloudflare.Env): Response {
       "",
       "Set the Telegram webhook with:",
       "",
-      `curl -X POST "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/setWebhook" \\`,
-      `  -H "Content-Type: application/json" \\`,
+      `curl -X POST "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/setWebhook" \\",
+      `  -H "Content-Type: application/json" \\",
       `  -d '{`,
       `    "url": "${webhookUrl}",`,
       secretLine,
@@ -620,19 +686,22 @@ export default {
       return setupTelegramWebhook(request, env);
     }
 
-    if (request.method === "POST" && url.pathname === WEBHOOK_PATH) {
-      const agent = await getAgentByName(
-        env.ChatIngressAgent,
-        getIngressAgentName(request)
-      );
-      return agent.fetch(request);
+    if (url.pathname.startsWith("/agents/")) {
+      return routeAgentRequest(request, env);
     }
 
-    const agentResponse = await routeAgentRequest(request, env);
-    if (agentResponse) {
-      return agentResponse;
+    const ingressAgentName = getIngressAgentName(request);
+    if (ingressAgentName) {
+      const ingressAgent = await getAgentByName(
+        env.ChatIngressAgent,
+        ingressAgentName
+      );
+      const response = await ingressAgent.fetch(request);
+      if (response.status !== 404) {
+        return response;
+      }
     }
 
     return new Response("Not found", { status: 404 });
   }
-} satisfies ExportedHandler<Cloudflare.Env>;
+};
