@@ -1,4 +1,4 @@
-export { CodemodeRuntime } from "@cloudflare/codemode";
+export { CodemodeRuntime } from "agents/browser";
 
 const mod = await import("./index");
 
