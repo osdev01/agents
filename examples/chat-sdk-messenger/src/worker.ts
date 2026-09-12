@@ -4,14 +4,9 @@ const mod = await import("./index");
 
 const conversationPrototype = mod.ConversationAgent.prototype as any;
 
-// Think assembles MCP tools before beforeTurn(). These are class-level settings
-// in the official Think lifecycle, so set them before the Agent starts rather
-// than inside onStart().
 conversationPrototype.waitForMcpConnections = { timeout: 15000 };
 conversationPrototype.includeMcpTools = true;
 
-// Register external MCP servers during Agent startup. addMcpServer() is
-// idempotent for the same name + URL, so it is safe across restarts/wakes.
 const originalOnStart = conversationPrototype.onStart;
 conversationPrototype.onStart = async function () {
   await originalOnStart?.call(this);
@@ -32,7 +27,7 @@ conversationPrototype.onStart = async function () {
         },
         retry: { maxAttempts: 3, baseDelayMs: 500 }
       });
-      console.log("[MCP] GitHub ready", { state: result.state, id: result.id });
+      console.log("[MCP] GitHub ready", { state: result.state });
     } catch (error) {
       console.error("[MCP] GitHub registration/discovery failed", error);
     }
@@ -51,7 +46,7 @@ conversationPrototype.onStart = async function () {
         },
         retry: { maxAttempts: 3, baseDelayMs: 500 }
       });
-      console.log("[MCP] Cloudflare ready", { state: result.state, id: result.id });
+      console.log("[MCP] Cloudflare ready", { state: result.state });
     } catch (error) {
       console.error("[MCP] Cloudflare registration/discovery failed", error);
     }
@@ -64,12 +59,7 @@ conversationPrototype.onStart = async function () {
     const servers = this.getMcpServers?.() ?? [];
     const tools = await this.mcp.listTools();
     console.log("[MCP] startup state", {
-      servers: servers.map((server: any) => ({
-        id: server.id,
-        name: server.name,
-        state: server.state,
-        error: server.error ?? null
-      })),
+      servers: servers.map((server: any) => ({ id: server.id, name: server.name, state: server.state, error: server.error ?? null })),
       toolCount: tools.length,
       toolNames: tools.map((tool: any) => tool.name)
     });
@@ -78,40 +68,26 @@ conversationPrototype.onStart = async function () {
   }
 };
 
-// Think assembles MCP tools before beforeTurn(). Do not call getAITools() here.
-// The important part is that service requests must not inherit the normal web
-// search activeTools/toolChoice from ConversationAgent.beforeTurn(), otherwise
-// Tavily/Exa can accidentally exclude the newly assembled MCP tools.
 const originalBeforeTurn = conversationPrototype.beforeTurn;
 conversationPrototype.beforeTurn = async function (ctx: any) {
   const config = (await originalBeforeTurn?.call(this, ctx)) ?? {};
   const toolNames = Object.keys(ctx?.tools ?? {});
-  const mcpToolNames = toolNames.filter((name) =>
-    /github|cloudflare|mcp/i.test(name)
-  );
+  const mcpToolNames = toolNames.filter((name) => /github|cloudflare|mcp/i.test(name));
 
   console.log("[MCP] assembled tool count", toolNames.length);
   console.log("[MCP] assembled service tools", mcpToolNames);
 
-  const serviceQuery = [...(ctx.messages ?? [])]
-    .reverse()
-    .find((message: any) => message.role === "user");
-  const userText = typeof serviceQuery?.content === "string"
-    ? serviceQuery.content
-    : JSON.stringify(serviceQuery?.content ?? "");
+  const serviceQuery = [...(ctx.messages ?? [])].reverse().find((message: any) => message.role === "user");
+  const userText = typeof serviceQuery?.content === "string" ? serviceQuery.content : JSON.stringify(serviceQuery?.content ?? "");
   const liveServiceRequest = /\b(last|latest|current|recent|status|deploy|deployment|build|worker|workers|logs?|cloudflare|github|repository|repo|pull request|commit|issue|dns|r2|d1|kv)\b/i.test(userText)
     || /(آخرین|وضعیت|دیپلوی|استقرار|لاگ|ورکر|گیت‌هاب|گیتهاب|ریپو|مخزن|کامیت|ایشو|کلودفلر)/iu.test(userText);
 
-  if (!liveServiceRequest) {
-    return config;
-  }
+  if (!liveServiceRequest) return config;
 
   const serviceInstruction = "\n\nLIVE SERVICE POLICY: This request concerns live GitHub/Cloudflare data. Use a matching connected MCP tool from the assembled MCP tools before answering. Do not substitute Tavily or Exa for live account data. If no matching MCP tool is available or the MCP call fails, say so clearly and do not guess.";
 
   if (!mcpToolNames.length) {
-    console.error("[MCP] live service request has no assembled MCP tools", {
-      query: userText.slice(0, 300)
-    });
+    console.error("[MCP] live service request has no assembled MCP tools", { query: userText.slice(0, 300) });
     return {
       ...config,
       activeTools: [],
@@ -121,9 +97,6 @@ conversationPrototype.beforeTurn = async function (ctx: any) {
     };
   }
 
-  // Replace, rather than merge, the web-search activeTools from the base agent.
-  // Otherwise its forced Tavily/Exa toolChoice can prevent MCP from ever being
-  // callable for a GitHub/Cloudflare request.
   return {
     ...config,
     activeTools: mcpToolNames,
