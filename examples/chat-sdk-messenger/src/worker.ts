@@ -5,17 +5,18 @@ const mod = await import("./index");
 const conversationPrototype = mod.ConversationAgent.prototype as any;
 
 // Connect external services through Cloudflare Agents MCP. Credentials stay in
-// Worker secrets; the MCP SDK persists the connection in the Agent's storage.
+// Worker secrets; MCP registrations persist in Agent SQL storage.
 const originalOnStart = conversationPrototype.onStart;
 conversationPrototype.onStart = async function () {
   await originalOnStart?.call(this);
 
-  this.waitForMcpConnections = { timeout: 10000 };
+  // Think must wait until MCP discovery has completed before inference.
+  this.waitForMcpConnections = { timeout: 15000 };
 
   const githubToken = this.env?.GITHUB_MCP_TOKEN;
   if (githubToken) {
     try {
-      await this.addMcpServer("GitHub", "https://api.githubcopilot.com/mcp/", {
+      const result = await this.addMcpServer("GitHub", "https://api.githubcopilot.com/mcp/", {
         id: "github",
         transport: {
           type: "streamable-http",
@@ -23,7 +24,7 @@ conversationPrototype.onStart = async function () {
         },
         retry: { maxAttempts: 3, baseDelayMs: 500 }
       });
-      console.log("[MCP] GitHub connected");
+      console.log("[MCP] GitHub connection", result);
     } catch (error) {
       console.error("[MCP] GitHub connection failed", error);
     }
@@ -34,7 +35,7 @@ conversationPrototype.onStart = async function () {
   const cloudflareToken = this.env?.CLOUDFLARE_MCP_TOKEN;
   if (cloudflareToken) {
     try {
-      await this.addMcpServer("Cloudflare API", "https://mcp.cloudflare.com/mcp", {
+      const result = await this.addMcpServer("Cloudflare API", "https://mcp.cloudflare.com/mcp", {
         id: "cloudflare",
         transport: {
           type: "streamable-http",
@@ -42,7 +43,7 @@ conversationPrototype.onStart = async function () {
         },
         retry: { maxAttempts: 3, baseDelayMs: 500 }
       });
-      console.log("[MCP] Cloudflare connected");
+      console.log("[MCP] Cloudflare connection", result);
     } catch (error) {
       console.error("[MCP] Cloudflare connection failed", error);
     }
@@ -55,20 +56,35 @@ const originalBeforeTurn = conversationPrototype.beforeTurn;
 conversationPrototype.beforeTurn = async function (ctx: any) {
   const config = (await originalBeforeTurn?.call(this, ctx)) ?? {};
 
-  // Search-mode activeTools would otherwise hide MCP tools on current/latest
-  // questions. Think exposes MCP tools with namespaced AI SDK keys, so use
-  // getAITools() here rather than the raw listTools() names.
-  const mcpToolNames = (() => {
-    try {
-      return Object.keys(this.mcp?.getAITools?.() ?? {});
-    } catch {
-      return [];
-    }
-  })();
+  // IMPORTANT: activeTools alone does not expose MCP tools. Explicitly inject
+  // the AI SDK ToolSet returned by getAITools(), using the namespaced keys.
+  // This avoids the previous bug where raw listTools() names were added to
+  // activeTools but the actual MCP tools were absent from the model ToolSet.
+  let mcpTools: Record<string, any> = {};
+  try {
+    mcpTools = this.mcp?.getAITools?.() ?? {};
+  } catch (error) {
+    console.error("[MCP] getAITools failed", error);
+  }
 
+  const mcpToolNames = Object.keys(mcpTools);
   const activeTools = Array.isArray(config.activeTools)
     ? [...new Set([...config.activeTools, ...mcpToolNames])]
     : config.activeTools;
+
+  const serviceQuery = [...(ctx.messages ?? [])]
+    .reverse()
+    .find((message: any) => message.role === "user");
+  const userText = typeof serviceQuery?.content === "string"
+    ? serviceQuery.content
+    : JSON.stringify(serviceQuery?.content ?? "");
+  const liveServiceRequest = /\b(last|latest|current|recent|status|deploy|deployment|build|worker|workers|logs?|cloudflare|github|repository|repo|pull request|commit|issue|dns|r2|d1|kv)\b/i.test(userText);
+
+  const serviceInstruction = liveServiceRequest
+    ? "\n\nLIVE SERVICE POLICY: This request concerns live GitHub/Cloudflare/account data. You MUST use the appropriate connected MCP tool before answering. Do not use Tavily, Exa, or general web search as a substitute. If no matching MCP tool is available or the MCP call fails, state that clearly and do not guess or fabricate current data."
+    : "";
+
+  const mergedTools = { ...(config.tools ?? {}), ...mcpTools };
 
   const exaMode = Array.isArray(config.activeTools)
     && config.activeTools.includes("exa_search")
@@ -76,30 +92,31 @@ conversationPrototype.beforeTurn = async function (ctx: any) {
     && config.toolChoice?.toolName === "exa_search";
 
   if (!exaMode || ctx.continuation) {
-    return { ...config, activeTools };
+    return {
+      ...config,
+      tools: mergedTools,
+      activeTools,
+      system: `${config.system ?? ctx.system ?? ""}${serviceInstruction}`
+    };
   }
 
-  // The current Think runtime can lose the Exa tool during the final model
-  // tool-set assembly. Keep Exa mode on the direct API path so Exa remains
-  // reliable while MCP tools continue to use the normal Think integration.
+  // Keep the existing reliable direct Exa path. MCP tools remain available on
+  // normal turns and are not used as a replacement for Exa mode.
   const apiKey = this.env?.EXA_API_KEY;
   if (!apiKey) {
     console.error("[EXA] EXA_API_KEY is missing");
     return {
       ...config,
+      tools: mergedTools,
       activeTools: [],
       toolChoice: "none",
       maxSteps: 1,
-      system: `${ctx.system}\n\nEXA ERROR: EXA_API_KEY is missing in the Worker environment.`
+      system: `${config.system ?? ctx.system ?? ""}\n\nEXA ERROR: EXA_API_KEY is missing in the Worker environment.`
     };
   }
 
-  const userMessage = [...(ctx.messages ?? [])].reverse().find((message: any) => message.role === "user");
-  const query = typeof userMessage?.content === "string"
-    ? userMessage.content.trim()
-    : JSON.stringify(userMessage?.content ?? "").trim();
-
-  if (!query) return { ...config, activeTools };
+  const query = userText.trim();
+  if (!query) return { ...config, tools: mergedTools, activeTools };
 
   console.log("[EXA DIRECT] search", { query: query.slice(0, 300) });
 
@@ -123,7 +140,8 @@ conversationPrototype.beforeTurn = async function (ctx: any) {
       console.error("[EXA DIRECT] HTTP error", response.status, raw.slice(0, 1000));
       return {
         ...config,
-        system: `${ctx.system}\n\nEXA SEARCH ERROR: HTTP ${response.status}\n${raw.slice(0, 2000)}`,
+        tools: mergedTools,
+        system: `${config.system ?? ctx.system ?? ""}\n\nEXA SEARCH ERROR: HTTP ${response.status}\n${raw.slice(0, 2000)}`,
         activeTools: [],
         toolChoice: "none",
         maxSteps: 1
@@ -165,7 +183,8 @@ conversationPrototype.beforeTurn = async function (ctx: any) {
 
     return {
       ...config,
-      system: `${ctx.system}${exaContext}`,
+      tools: mergedTools,
+      system: `${config.system ?? ctx.system ?? ""}${exaContext}`,
       activeTools: [],
       toolChoice: "none",
       maxSteps: 1
@@ -174,7 +193,8 @@ conversationPrototype.beforeTurn = async function (ctx: any) {
     console.error("[EXA DIRECT] request failed", error);
     return {
       ...config,
-      system: `${ctx.system}\n\nEXA SEARCH ERROR: ${String(error).slice(0, 2000)}`,
+      tools: mergedTools,
+      system: `${config.system ?? ctx.system ?? ""}\n\nEXA SEARCH ERROR: ${String(error).slice(0, 2000)}`,
       activeTools: [],
       toolChoice: "none",
       maxSteps: 1
