@@ -1,0 +1,121 @@
+name: Patch MCP connectors
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - .github/workflows/patch-mcp-connectors-trigger
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Patch ConversationAgent MCP connectors
+        run: |
+          python3 <<'PY'
+          from pathlib import Path
+
+          p = Path('examples/chat-sdk-messenger/src/intelligence/conversation-agent.ts')
+          s = p.read_text()
+
+          old = '  private pendingSearchReport: string | null = null;\n\n  override getModel() {'
+          new = '''  private pendingSearchReport: string | null = null;
+
+  async onStart(): Promise<void> {
+    const env = this.env as Env & {
+      GITHUB_MCP_TOKEN?: string;
+      CLOUDFLARE_MCP_TOKEN?: string;
+    };
+
+    if (env.GITHUB_MCP_TOKEN) {
+      try {
+        await this.addMcpServer("GitHub", "https://api.githubcopilot.com/mcp/", {
+          id: "github",
+          transport: {
+            type: "streamable-http",
+            headers: {
+              Authorization: `Bearer ${env.GITHUB_MCP_TOKEN}`,
+            },
+          },
+          retry: { maxAttempts: 3, baseDelayMs: 500 },
+        });
+        console.log("[MCP] GitHub connected");
+      } catch (error) {
+        console.error("[MCP] GitHub connection failed", error);
+      }
+    } else {
+      console.log("[MCP] GitHub skipped: GITHUB_MCP_TOKEN is not configured");
+    }
+
+    if (env.CLOUDFLARE_MCP_TOKEN) {
+      try {
+        await this.addMcpServer("Cloudflare API", "https://mcp.cloudflare.com/mcp", {
+          id: "cloudflare",
+          transport: {
+            type: "streamable-http",
+            headers: {
+              Authorization: `Bearer ${env.CLOUDFLARE_MCP_TOKEN}`,
+            },
+          },
+          retry: { maxAttempts: 3, baseDelayMs: 500 },
+        });
+        console.log("[MCP] Cloudflare connected");
+      } catch (error) {
+        console.error("[MCP] Cloudflare connection failed", error);
+      }
+    } else {
+      console.log("[MCP] Cloudflare skipped: CLOUDFLARE_MCP_TOKEN is not configured");
+    }
+  }
+
+  private mcpToolNames(): string[] {
+    try {
+      return this.mcp.listTools().map((item) => item.name);
+    } catch {
+      return [];
+    }
+  }
+
+  override getModel() {'''
+          if old not in s:
+              raise SystemExit('ConversationAgent insertion point not found')
+          s = s.replace(old, new, 1)
+
+          old = '''    const mode = searchModeFromContext(ctx);
+    console.log("[SEARCH POLICY] selected mode", { mode, query: cleanText(query, 300) });
+
+    if (mode === "exa") {'''
+          new = '''    const mode = searchModeFromContext(ctx);
+    console.log("[SEARCH POLICY] selected mode", { mode, query: cleanText(query, 300) });
+    const connectorTools = this.mcpToolNames();
+    const withConnectors = (tools: string[]) => [...new Set([...tools, ...connectorTools])];
+
+    if (mode === "exa") {'''
+          if old not in s:
+              raise SystemExit('beforeTurn mode insertion point not found')
+          s = s.replace(old, new, 1)
+
+          s = s.replace('return { activeTools: ["exa_search", "fetch_to_markdown", "browse"], toolChoice:', 'return { activeTools: withConnectors(["exa_search", "fetch_to_markdown", "browse"]), toolChoice:', 1)
+          s = s.replace('return { activeTools: ["tavily_research", "tavily_extract", "fetch_to_markdown", "browse"], toolChoice:', 'return { activeTools: withConnectors(["tavily_research", "tavily_extract", "fetch_to_markdown", "browse"]), toolChoice:', 1)
+          s = s.replace('return { activeTools: ["tavily_search", "exa_search", "tavily_extract", "fetch_to_markdown", "browse"], maxSteps:', 'return { activeTools: withConnectors(["tavily_search", "exa_search", "tavily_extract", "fetch_to_markdown", "browse"]), maxSteps:', 1)
+          s = s.replace('return { activeTools: ["tavily_search", "tavily_research", "exa_search", "tavily_extract", "fetch_to_markdown", "browse"], toolChoice:', 'return { activeTools: withConnectors(["tavily_search", "tavily_research", "exa_search", "tavily_extract", "fetch_to_markdown", "browse"]), toolChoice:', 1)
+
+          p.write_text(s)
+          PY
+
+      - name: Remove temporary patch files
+        run: |
+          rm -f .github/workflows/patch-mcp-connectors.yml .github/workflows/patch-mcp-connectors-trigger
+
+      - name: Commit final MCP connector patch
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add examples/chat-sdk-messenger/src/intelligence/conversation-agent.ts .github/workflows/patch-mcp-connectors.yml .github/workflows/patch-mcp-connectors-trigger
+          git diff --cached --quiet && exit 0
+          git commit -m "feat: connect GitHub and Cloudflare through MCP"
+          git push
