@@ -530,8 +530,13 @@ export class ChatIngressAgent extends Agent {
 
     try {
       await thread.startTyping("Thinking...");
+      const threadState = await thread.state as { searchMode?: string } | null;
       agent = await this.getConversationAgent(thread);
-      await agent.chat(await toThinkUserMessage(message), callback);
+      console.log("[SEARCH MODE] thread state", {
+        threadId: thread.id,
+        searchMode: threadState?.searchMode ?? "auto"
+      });
+      await agent.chat(await toThinkUserMessage(message, threadState?.searchMode), callback);
       completedModelTurn = true;
       callback.close();
       await post;

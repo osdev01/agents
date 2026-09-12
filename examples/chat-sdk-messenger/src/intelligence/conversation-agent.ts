@@ -62,8 +62,10 @@ function latestUserText(ctx: TurnContext): string {
 }
 
 function searchModeFromContext(ctx: TurnContext): SearchMode {
+  // The Telegram /menu selection is persisted in Chat SDK thread state and
+  // injected into the next user message as [SEARCH_MODE:...]. Search all
+  // message roles so the marker is actually visible to beforeTurn().
   for (const message of [...ctx.messages].reverse()) {
-    if (message.role !== "assistant") continue;
     const content = typeof message.content === "string" ? message.content : JSON.stringify(message.content ?? "");
     const match = content.match(/\[SEARCH_MODE:(auto|tavily|exa|research|both)\]/i);
     if (match) return match[1].toLowerCase() as SearchMode;

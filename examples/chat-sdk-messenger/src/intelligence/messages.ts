@@ -39,11 +39,20 @@ export function shouldRouteToAi(input: AiRoutingInput): boolean {
   return input.isMention === true || isAskCommand(input.text);
 }
 
-export async function toThinkUserMessage(message: Message): Promise<UIMessage> {
+export async function toThinkUserMessage(
+  message: Message,
+  searchMode?: string
+): Promise<UIMessage> {
   const text = stripAskCommand(message.text).trim() || message.text.trim();
   const authorName =
     message.author.fullName || message.author.userName || message.author.userId;
-  const content = authorName ? `${authorName}: ${text}` : text;
+  const modeMarker = /^(auto|tavily|exa|research|both)$/i.test(searchMode ?? '')
+    ? `[SEARCH_MODE:${searchMode!.toLowerCase()}]`
+    : '';
+  const content = [
+    modeMarker,
+    authorName ? `${authorName}: ${text}` : text
+  ].filter(Boolean).join("\n");
 
   // Web research is handled centrally by ConversationAgent.beforeTurn().
   // Do not search here: doing so duplicates the request and can corrupt

@@ -126,6 +126,10 @@ export async function postMenu(
 
   const selectedMode = SEARCH_MODE_ACTIONS.find((mode) => mode.id === menuId);
   if (selectedMode) {
+    // Persist the selected search mode in Chat SDK thread state. The menu card
+    // itself is not part of the Think sub-agent's message history, so relying
+    // on [SEARCH_MODE:...] in the posted card cannot configure beforeTurn().
+    await thread.setState({ searchMode: selectedMode.marker });
     await thread.post(
       <Card title={`Search Mode: ${selectedMode.label}`}>
         <CardText>
