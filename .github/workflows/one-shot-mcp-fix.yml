@@ -1,0 +1,110 @@
+name: one-shot-mcp-fix
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  fix:
+    if: ${{ !contains(github.event.head_commit.message, '[mcp-fix-done]') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Remove Worker Loader dependency from MCP tool path
+        shell: python
+        run: |
+          from pathlib import Path
+          import re
+
+          p = Path('examples/chat-sdk-messenger/src/intelligence/conversation-agent.ts')
+          s = p.read_text()
+
+          s = s.replace('import { createExecuteTool } from "@cloudflare/think/tools/execute";\n', '')
+          s = s.replace('through the execute tool; never substitute web search for account data.', 'through the MCP search/execute tools; never substitute web search for account data.')
+          s = s.replace('activeTools: ["execute"],', 'activeTools: ["mcp_search", "mcp_execute"],')
+
+          marker = 'override getTools(): ToolSet {'
+          start = s.index(marker)
+          end = s.index('  override async onChatResponse', start)
+
+          replacement = '''override getTools(): ToolSet {
+            const tavilySearchTool = tool({ description: "Official Tavily web search. Returns ranked sources and URLs.", inputSchema: jsonSchema<{ query: string; depth?: SearchDepth; topic?: SearchTopic; maxResults?: number }>({ type: "object", properties: { query: { type: "string" }, depth: { type: "string", enum: ["basic", "advanced"] }, topic: { type: "string", enum: ["general", "news", "finance"] }, maxResults: { type: "number" } }, required: ["query"], additionalProperties: false }), execute: async ({ query, depth, topic, maxResults }) => { const result = await tavilySearch(this.env, query, { depth, topic, maxResults }); this.pendingSearchReport = result.report; return result.context; } });
+            const exaSearchTool = tool({ description: "Independent Exa web search, especially useful for technical docs, GitHub, research, and coding-related current information.", inputSchema: jsonSchema<{ query: string; maxResults?: number }>({ type: "object", properties: { query: { type: "string" }, maxResults: { type: "number" } }, required: ["query"], additionalProperties: false }), execute: async ({ query, maxResults }) => { const result = await exaSearch(this.env, query, maxResults ?? 8); this.pendingSearchReport = result.report; return result.context; } });
+            const tavilyResearchTool = tool({ description: "Official Tavily Deep Research for deep research, multi-source fact checking, comparisons, rankings, and best-of questions.", inputSchema: jsonSchema<{ query: string; model?: ResearchModel }>({ type: "object", properties: { query: { type: "string" }, model: { type: "string", enum: ["auto", "mini", "pro"] } }, required: ["query"], additionalProperties: false }), execute: async ({ query, model }) => { const result = await tavilyResearch(this.env, query, model ?? "mini"); this.pendingSearchReport = result.report; return result.context; } });
+            const tavilyExtractTool = tool({ description: "Extract readable/raw content from up to 20 specific public URLs using Tavily.", inputSchema: jsonSchema<{ urls: string[] }>({ type: "object", properties: { urls: { type: "array", items: { type: "string" } } }, required: ["urls"], additionalProperties: false }), execute: async ({ urls }) => { const result = await tavilyExtract(this.env, urls); this.pendingSearchReport = result.report; return result.context; } });
+            const fetchToMarkdown = tool({ description: "Fetch a public URL through Cloudflare Browser Run and return cleaned Markdown/text.", inputSchema: jsonSchema<{ url: string }>({ type: "object", properties: { url: { type: "string" } }, required: ["url"] }), execute: async ({ url }) => browserMarkdown(this.env.BROWSER, url) });
+            const browse = tool({ description: "Read a public URL as cleaned browser content.", inputSchema: jsonSchema<{ url: string }>({ type: "object", properties: { url: { type: "string" } }, required: ["url"] }), execute: async ({ url }) => browserContent(this.env.BROWSER, url) });
+
+            const mcpSearch = tool({
+              description: "Discover connected MCP tools for GitHub or Cloudflare without loading their full schemas. Use this first for live account/repository/service requests. Returns matching serverId, tool name, description, and input schema.",
+              inputSchema: jsonSchema<{ query: string; server?: string }>({ type: "object", properties: { query: { type: "string" }, server: { type: "string", enum: ["GitHub", "Cloudflare"] } }, required: ["query"], additionalProperties: false }),
+              execute: async ({ query, server }) => {
+                await this.mcp.waitForConnections({ timeout: 15000 });
+                const tools = await this.mcp.listTools();
+                const q = query.toLowerCase().trim();
+                const terms = q.split(/\\s+/).filter(Boolean);
+                const matches = tools
+                  .filter((item: any) => !server || String(item.serverId || "").toLowerCase() === server.toLowerCase() || String(item.serverName || "").toLowerCase() === server.toLowerCase())
+                  .map((item: any) => {
+                    const haystack = [item.name, item.description, item.serverId, item.serverName].filter(Boolean).join(" ").toLowerCase();
+                    const score = terms.reduce((n, term) => n + (haystack.includes(term) ? 1 : 0), 0);
+                    return { score, serverId: item.serverId, name: item.name, description: item.description, inputSchema: item.inputSchema };
+                  })
+                  .filter((item: any) => item.score > 0 || !q)
+                  .sort((a: any, b: any) => b.score - a.score)
+                  .slice(0, 12)
+                  .map(({ score, ...item }: any) => item);
+                return JSON.stringify({ count: matches.length, tools: matches });
+              }
+            });
+
+            const mcpExecute = tool({
+              description: "Execute one connected MCP tool discovered by mcp_search. Pass the exact serverId, tool name, and arguments matching the returned input schema.",
+              inputSchema: jsonSchema<{ serverId: string; toolName: string; arguments?: Record<string, unknown> }>({ type: "object", properties: { serverId: { type: "string" }, toolName: { type: "string" }, arguments: { type: "object", additionalProperties: true } }, required: ["serverId", "toolName"], additionalProperties: false }),
+              execute: async ({ serverId, toolName, arguments: args }) => {
+                await this.mcp.waitForConnections({ timeout: 15000 });
+                const result = await this.mcp.callTool({ name: toolName, serverId, arguments: args ?? {} });
+                return JSON.stringify(result);
+              }
+            });
+
+            return { tavily_search: tavilySearchTool, exa_search: exaSearchTool, tavily_research: tavilyResearchTool, tavily_extract: tavilyExtractTool, fetch_to_markdown: fetchToMarkdown, browse, mcp_search: mcpSearch, mcp_execute: mcpExecute };
+          }
+          '''
+
+          s = s[:start] + replacement + s[end:]
+          p.write_text(s)
+
+          # Remove the now-unneeded Code Mode runtime export from the worker entry.
+          w = Path('examples/chat-sdk-messenger/src/worker.ts')
+          ws = w.read_text()
+          ws = ws.replace('export { CodemodeRuntime } from "agents/browser";\n\n', '')
+          w.write_text(ws)
+
+          # Remove the paid-only Worker Loader binding.
+          r = Path('examples/chat-sdk-messenger/wrangler.jsonc')
+          rs = r.read_text()
+          rs = rs.replace('  "worker_loaders": [{ "binding": "LOADER" }],\n', '')
+          r.write_text(rs)
+
+      - name: Commit fixed MCP integration
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add examples/chat-sdk-messenger/src/intelligence/conversation-agent.ts examples/chat-sdk-messenger/src/worker.ts examples/chat-sdk-messenger/wrangler.jsonc
+          git diff --cached --quiet && exit 0
+          git commit -m "fix MCP tools without Dynamic Workers [mcp-fix-done]"
+          git push
+
+      - name: Remove one-shot workflow
+        if: ${{ success() }}
+        run: |
+          git rm .github/workflows/one-shot-mcp-fix.yml
+          git commit -m "remove one-shot MCP fix workflow [mcp-fix-done]"
+          git push
