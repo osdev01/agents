@@ -2,33 +2,95 @@ export { CodemodeRuntime } from "agents/browser";
 
 const mod = await import("./index");
 
-// The current Think runtime is exposing the Tavily tools correctly but the
-// Exa tool is disappearing from the final model tool set. For Exa mode we
-// therefore execute Exa directly in beforeTurn and give the returned evidence
-// to the model as part of the turn system context. This removes the failing
-// model -> exa_search tool-call hop entirely while keeping the existing
-// Tavily/tool-based modes unchanged.
 const conversationPrototype = mod.ConversationAgent.prototype as any;
-const originalBeforeTurn = conversationPrototype.beforeTurn;
 
-conversationPrototype.beforeTurn = async function (ctx: any) {
-  const config = (await originalBeforeTurn?.call(this, ctx)) ?? {};
-  const activeTools = Array.isArray(config.activeTools) ? config.activeTools : [];
-  const exaMode = activeTools.includes("exa_search") && config.toolChoice?.type === "tool" && config.toolChoice?.toolName === "exa_search";
+// Connect external services through Cloudflare Agents MCP. Credentials stay in
+// Worker secrets; the MCP SDK persists the connection in the Agent's storage.
+const originalOnStart = conversationPrototype.onStart;
+conversationPrototype.onStart = async function () {
+  await originalOnStart?.call(this);
 
-  if (!exaMode || ctx.continuation) {
-    return config;
+  this.waitForMcpConnections = { timeout: 10000 };
+
+  const githubToken = this.env?.GITHUB_MCP_TOKEN;
+  if (githubToken) {
+    try {
+      await this.addMcpServer("GitHub", "https://api.githubcopilot.com/mcp/", {
+        id: "github",
+        transport: {
+          type: "streamable-http",
+          headers: { Authorization: `Bearer ${githubToken}` }
+        },
+        retry: { maxAttempts: 3, baseDelayMs: 500 }
+      });
+      console.log("[MCP] GitHub connected");
+    } catch (error) {
+      console.error("[MCP] GitHub connection failed", error);
+    }
+  } else {
+    console.log("[MCP] GitHub skipped: GITHUB_MCP_TOKEN is not configured");
   }
 
+  const cloudflareToken = this.env?.CLOUDFLARE_MCP_TOKEN;
+  if (cloudflareToken) {
+    try {
+      await this.addMcpServer("Cloudflare API", "https://mcp.cloudflare.com/mcp", {
+        id: "cloudflare",
+        transport: {
+          type: "streamable-http",
+          headers: { Authorization: `Bearer ${cloudflareToken}` }
+        },
+        retry: { maxAttempts: 3, baseDelayMs: 500 }
+      });
+      console.log("[MCP] Cloudflare connected");
+    } catch (error) {
+      console.error("[MCP] Cloudflare connection failed", error);
+    }
+  } else {
+    console.log("[MCP] Cloudflare skipped: CLOUDFLARE_MCP_TOKEN is not configured");
+  }
+};
+
+const originalBeforeTurn = conversationPrototype.beforeTurn;
+conversationPrototype.beforeTurn = async function (ctx: any) {
+  const config = (await originalBeforeTurn?.call(this, ctx)) ?? {};
+
+  // Search-mode activeTools would otherwise hide MCP tools on current/latest
+  // questions. Keep the selected search tools while also allowing connected
+  // GitHub/Cloudflare MCP tools on the same turn.
+  const mcpToolNames = (() => {
+    try {
+      return this.mcp?.listTools?.().map((tool: any) => tool.name) ?? [];
+    } catch {
+      return [];
+    }
+  })();
+
+  const activeTools = Array.isArray(config.activeTools)
+    ? [...new Set([...config.activeTools, ...mcpToolNames])]
+    : config.activeTools;
+
+  const exaMode = Array.isArray(config.activeTools)
+    && config.activeTools.includes("exa_search")
+    && config.toolChoice?.type === "tool"
+    && config.toolChoice?.toolName === "exa_search";
+
+  if (!exaMode || ctx.continuation) {
+    return { ...config, activeTools };
+  }
+
+  // The current Think runtime can lose the Exa tool during the final model
+  // tool-set assembly. Keep Exa mode on the direct API path so Exa remains
+  // reliable while MCP tools continue to use the normal Think integration.
   const apiKey = this.env?.EXA_API_KEY;
   if (!apiKey) {
     console.error("[EXA] EXA_API_KEY is missing");
     return {
       ...config,
-      system: `${ctx.system}\n\nEXA ERROR: EXA_API_KEY is missing in the Worker environment.`,
       activeTools: [],
       toolChoice: "none",
-      maxSteps: 1
+      maxSteps: 1,
+      system: `${ctx.system}\n\nEXA ERROR: EXA_API_KEY is missing in the Worker environment.`
     };
   }
 
@@ -37,7 +99,7 @@ conversationPrototype.beforeTurn = async function (ctx: any) {
     ? userMessage.content.trim()
     : JSON.stringify(userMessage?.content ?? "").trim();
 
-  if (!query) return config;
+  if (!query) return { ...config, activeTools };
 
   console.log("[EXA DIRECT] search", { query: query.slice(0, 300) });
 
@@ -91,7 +153,7 @@ conversationPrototype.beforeTurn = async function (ctx: any) {
 
     const exaContext = [
       "\n\n===== EXA DIRECT SEARCH RESULT =====",
-      `Provider: Exa`,
+      "Provider: Exa",
       `Query: ${query}`,
       `Result count: ${results.length}`,
       evidence || "No results returned by Exa.",
