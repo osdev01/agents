@@ -89,14 +89,6 @@ function setupErrorResponse(error: Error): Response {
   );
 }
 
-/**
- * Telegram marks `/menu` and `/reset` with a `bot_command` entity. The current
- * Telegram Chat SDK adapter intentionally does not advertise slash-command
- * support, so those updates can be dropped before normal DM/message handlers
- * run. Strip only the command entity and let the exact same text continue
- * through Chat SDK's ordinary message pipeline, where our existing
- * isMenuCommand/isResetCommand routing handles it.
- */
 async function normalizeTelegramCommandWebhook(
   request: Request
 ): Promise<Request> {
@@ -648,8 +640,8 @@ function setupResponse(request: Request, env: Cloudflare.Env): Response {
       "",
       "Set the Telegram webhook with:",
       "",
-      `curl -X POST "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/setWebhook" \\",
-      `  -H "Content-Type: application/json" \\",
+      `curl -X POST "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/setWebhook" \\`,
+      `  -H "Content-Type: application/json" \\`,
       `  -d '{`,
       `    "url": "${webhookUrl}",`,
       secretLine,
