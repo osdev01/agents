@@ -25,35 +25,43 @@ ConversationAgentClass.prototype.getTools = function () {
     description: "Search the connected GitHub or Cloudflare MCP tool catalog. Use this before mcp_execute when you need live GitHub or Cloudflare data. Returns matching tool names, descriptions, server IDs, and input schemas.",
     inputSchema: jsonSchema({
       type: "object",
-      properties: { query: { type: "string", description: "What live GitHub or Cloudflare operation is needed" } },
+      properties: {
+        query: { type: "string", description: "What live GitHub or Cloudflare operation is needed" },
+        server: { type: "string", enum: ["github", "cloudflare"] }
+      },
       required: ["query"],
       additionalProperties: false
     }),
-    execute: async ({ query }: { query: string }) => {
-      const all = this.mcp.listTools();
+    execute: async ({ query, server }: { query: string; server?: string }) => {
+      await this.mcp.waitForConnections({ timeout: 15000 });
+      const all = await this.mcp.listTools();
+      const filtered = server ? all.filter((item: any) => String(item.serverId).toLowerCase() === server.toLowerCase()) : all;
       const terms = query.toLowerCase().split(/\s+/).filter(Boolean);
-      const scored = all.map((item: any) => {
-        const haystack = [item.name, item.title, item.description].filter(Boolean).join(" ").toLowerCase();
+      const scored = filtered.map((item: any) => {
+        const haystack = [item.serverId, item.name, item.title, item.description].filter(Boolean).join(" ").toLowerCase();
         const score = terms.reduce((sum, term) => sum + (haystack.includes(term) ? 1 : 0), 0);
         return { item, score };
       }).filter((entry: any) => entry.score > 0).sort((a: any, b: any) => b.score - a.score).slice(0, 12);
-      const matches = (scored.length ? scored : all.slice(0, 12)).map(({ item }: any) => ({
-        serverId: item.serverId,
-        name: item.name,
-        title: item.title ?? item.annotations?.title ?? item.name,
-        description: item.description ?? "",
-        inputSchema: item.inputSchema
-      }));
-      return { query, count: matches.length, matches };
+      const matches = (scored.length ? scored : filtered.slice(0, 12)).map((entry: any) => {
+        const item = entry.item;
+        return {
+          serverId: item.serverId,
+          name: item.name,
+          title: item.title ?? item.annotations?.title ?? item.name,
+          description: item.description ?? "",
+          inputSchema: item.inputSchema
+        };
+      });
+      return { query, server: server ?? null, count: matches.length, matches };
     }
   });
 
   tools.mcp_execute = tool({
-    description: "Execute one discovered GitHub or Cloudflare MCP tool using the exact serverId, tool name, and JSON arguments returned by mcp_search.",
+    description: "Execute one discovered GitHub or Cloudflare MCP tool using the exact serverId, name, and JSON arguments returned by mcp_search.",
     inputSchema: jsonSchema({
       type: "object",
       properties: {
-        serverId: { type: "string", description: "MCP server ID returned by mcp_search, usually github or cloudflare" },
+        serverId: { type: "string", description: "MCP server ID returned by mcp_search" },
         name: { type: "string", description: "Exact MCP tool name returned by mcp_search" },
         arguments: { type: "object", description: "Arguments matching the selected MCP tool input schema", additionalProperties: true }
       },
@@ -61,7 +69,9 @@ ConversationAgentClass.prototype.getTools = function () {
       additionalProperties: false
     }),
     execute: async ({ serverId, name, arguments: args }: { serverId: string; name: string; arguments: Record<string, unknown> }) => {
-      return await this.mcp.callTool({ serverId, name, arguments: args });
+      await this.mcp.waitForConnections({ timeout: 15000 });
+      const result = await this.mcp.callTool({ serverId, name, arguments: args });
+      return result;
     }
   });
 
