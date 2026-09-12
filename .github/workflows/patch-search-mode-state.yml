@@ -1,0 +1,75 @@
+name: Patch search mode state
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Apply search mode persistence fix
+        shell: python
+        run: |
+          from pathlib import Path
+
+          root = Path('examples/chat-sdk-messenger/src')
+
+          menu = root / 'menu.tsx'
+          text = menu.read_text()
+          old = '''  if (selectedMode) {\n    await thread.post(\n      <Card title={`Search Mode: ${selectedMode.label}`}>'''
+          new = '''  if (selectedMode) {\n    // Persist the selected search mode in Chat SDK thread state. The menu card\n    // itself is not part of the Think sub-agent's message history, so relying\n    // on [SEARCH_MODE:...] in the posted card cannot configure beforeTurn().\n    await thread.setState({ searchMode: selectedMode.marker });\n    await thread.post(\n      <Card title={`Search Mode: ${selectedMode.label}`}>'''
+          if old not in text:
+              raise SystemExit('menu.tsx target not found')
+          menu.write_text(text.replace(old, new, 1))
+
+          messages = root / 'intelligence/messages.ts'
+          text = messages.read_text()
+          old = '''export async function toThinkUserMessage(message: Message): Promise<UIMessage> {\n  const text = stripAskCommand(message.text).trim() || message.text.trim();\n  const authorName =\n    message.author.fullName || message.author.userName || message.author.userId;\n  const content = authorName ? `${authorName}: ${text}` : text;'''
+          new = '''export async function toThinkUserMessage(\n  message: Message,\n  searchMode?: string\n): Promise<UIMessage> {\n  const text = stripAskCommand(message.text).trim() || message.text.trim();\n  const authorName =\n    message.author.fullName || message.author.userName || message.author.userId;\n  const modeMarker = /^(auto|tavily|exa|research|both)$/i.test(searchMode ?? '')\n    ? `[SEARCH_MODE:${searchMode!.toLowerCase()}]`\n    : '';\n  const content = [\n    modeMarker,\n    authorName ? `${authorName}: ${text}` : text\n  ].filter(Boolean).join("\\n");'''
+          if old not in text:
+              raise SystemExit('messages.ts target not found')
+          messages.write_text(text.replace(old, new, 1))
+
+          agent = root / 'intelligence/conversation-agent.ts'
+          text = agent.read_text()
+          old = '''function searchModeFromContext(ctx: TurnContext): SearchMode {\n  for (const message of [...ctx.messages].reverse()) {\n    if (message.role !== "assistant") continue;\n    const content = typeof message.content === "string" ? message.content : JSON.stringify(message.content ?? "");\n    const match = content.match(/\\[SEARCH_MODE:(auto|tavily|exa|research|both)\\]/i);\n    if (match) return match[1].toLowerCase() as SearchMode;\n  }\n  return "auto";\n}'''
+          new = '''function searchModeFromContext(ctx: TurnContext): SearchMode {\n  // The Telegram /menu selection is persisted in Chat SDK thread state and\n  // injected into the next user message as [SEARCH_MODE:...]. Search all\n  // message roles so the marker is actually visible to beforeTurn().\n  for (const message of [...ctx.messages].reverse()) {\n    const content = typeof message.content === "string" ? message.content : JSON.stringify(message.content ?? "");\n    const match = content.match(/\\[SEARCH_MODE:(auto|tavily|exa|research|both)\\]/i);\n    if (match) return match[1].toLowerCase() as SearchMode;\n  }\n  return "auto";\n}'''
+          if old not in text:
+              raise SystemExit('conversation-agent.ts target not found')
+          agent.write_text(text.replace(old, new, 1))
+
+          index = root / 'index.ts'
+          text = index.read_text()
+          old = '''      await thread.startTyping("Thinking...");\n      agent = await this.getConversationAgent(thread);\n      await agent.chat(await toThinkUserMessage(message), callback);'''
+          new = '''      await thread.startTyping("Thinking...");\n      const threadState = await thread.state as { searchMode?: string } | null;\n      agent = await this.getConversationAgent(thread);\n      console.log("[SEARCH MODE] thread state", {\n        threadId: thread.id,\n        searchMode: threadState?.searchMode ?? "auto"\n      });\n      await agent.chat(await toThinkUserMessage(message, threadState?.searchMode), callback);'''
+          if old not in text:
+              raise SystemExit('index.ts target not found')
+          index.write_text(text.replace(old, new, 1))
+
+          workflow = Path('.github/workflows/patch-search-mode-state.yml')
+          marker = Path('.search-mode-state-patched')
+          marker.write_text('Search mode persistence patch applied.\n')
+          workflow.unlink(missing_ok=True)
+
+      - name: Commit final patch
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add examples/chat-sdk-messenger/src/menu.tsx \
+            examples/chat-sdk-messenger/src/intelligence/messages.ts \
+            examples/chat-sdk-messenger/src/intelligence/conversation-agent.ts \
+            examples/chat-sdk-messenger/src/index.ts \
+            .search-mode-state-patched \
+            .github/workflows/patch-search-mode-state.yml
+          git diff --cached --quiet && exit 0
+          git commit -m "fix: persist Telegram search mode in thread state"
+          git push
