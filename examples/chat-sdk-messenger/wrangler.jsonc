@@ -2,7 +2,7 @@
   "$schema": "./node_modules/wrangler/config-schema.json",
   "ai": { "binding": "AI", "remote": true },
   "name": "chat-sdk-messenger",
-  "main": "src/index.ts",
+  "main": "src/worker.ts",
   "compatibility_date": "2026-06-11",
   "compatibility_flags": ["nodejs_compat"],
   "browser": { "binding": "BROWSER", "remote": true },
