@@ -56,11 +56,11 @@ conversationPrototype.beforeTurn = async function (ctx: any) {
   const config = (await originalBeforeTurn?.call(this, ctx)) ?? {};
 
   // Search-mode activeTools would otherwise hide MCP tools on current/latest
-  // questions. Keep the selected search tools while also allowing connected
-  // GitHub/Cloudflare MCP tools on the same turn.
+  // questions. Think exposes MCP tools with namespaced AI SDK keys, so use
+  // getAITools() here rather than the raw listTools() names.
   const mcpToolNames = (() => {
     try {
-      return this.mcp?.listTools?.().map((tool: any) => tool.name) ?? [];
+      return Object.keys(this.mcp?.getAITools?.() ?? {});
     } catch {
       return [];
     }
