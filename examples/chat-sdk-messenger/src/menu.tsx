@@ -63,6 +63,10 @@ export const DEMO_LOOKUP = new Map<string, Demo>(
 );
 
 export async function postMainMenu(thread: DemoThread): Promise<void> {
+  // Keep a plain-text acknowledgement before the rich card so the command
+  // remains visibly handled even when a Telegram client has trouble rendering
+  // the Chat SDK card/keyboard.
+  await thread.post("📋 Menu");
   await thread.post(
     <Card title="Chat SDK on Cloudflare Workers">
       <CardText>
@@ -104,7 +108,9 @@ export async function postMenu(
   if (menuId === SEARCH_MODE_MENU_ID) {
     await thread.post(
       <Card title="⚙️ Search Mode">
-        <CardText>Choose which web-search strategy this Telegram thread should use.</CardText>
+        <CardText>
+          Choose which web-search strategy this Telegram thread should use.
+        </CardText>
         {SEARCH_MODE_ACTIONS.map((mode) => (
           <Actions key={mode.id}>
             <Button id={mode.id}>{mode.label}</Button>
