@@ -26,52 +26,61 @@ export class ConversationAgent extends Think {
   private pendingSearchReport: string | null = null;
   includeMcpTools = false;
   waitForMcpConnections = { timeout: 15000 };
-  override async onStart() { await super.onStart(); const env = this.env as Env & { GITHUB_MCP_TOKEN?: string; CLOUDFLARE_MCP_TOKEN?: string }; const servers: Array<[string,string,string|undefined]> = [["GitHub","https://api.githubcopilot.com/mcp/",env.GITHUB_MCP_TOKEN],["Cloudflare","https://mcp.cloudflare.com/mcp",env.CLOUDFLARE_MCP_TOKEN]]; for (const [name,url,token] of servers) { if (!token) { console.warn(`[MCP] ${name} token is not configured`); continue; } try { const result = await this.addMcpServer(name,url,{id:name === "GitHub" ? "github" : "cloudflare",transport:{type:"streamable-http",headers:{Authorization:`Bearer ${token}`}},retry:{maxAttempts:3,baseDelayMs:500}}); console.log(`[MCP] ${name}`,{state:result.state,id:result.id}); } catch (error) { console.error(`[MCP] ${name} connection failed`,error); } } try { await this.mcp.waitForConnections({timeout:15000}); const tools = await this.mcp.listTools(); console.log("[MCP] connected",{toolCount:tools.length,toolNames:tools.map((item:any)=>item.name)}); } catch (error) { console.error("[MCP] wait/list failed",error); } }
+  override async onStart() {
+    await super.onStart();
+    const env = this.env as Env & { GITHUB_MCP_TOKEN?: string; CLOUDFLARE_MCP_TOKEN?: string };
+    const servers: Array<[string, string, string | undefined, string]> = [
+      ["GitHub", "https://api.githubcopilot.com/mcp/", env.GITHUB_MCP_TOKEN, "github"],
+      ["Cloudflare", "https://mcp.cloudflare.com/mcp", env.CLOUDFLARE_MCP_TOKEN, "cloudflare"],
+    ];
+
+    for (const [name, url, token, id] of servers) {
+      if (!token) {
+        console.warn(`[MCP] ${name} token is not configured`);
+        continue;
+      }
+      try {
+        // MCP registrations are persisted by the Agent. Re-registering with the
+        // same name/URL can reuse an old persisted connection, so remove the
+        // previous registration first to guarantee that the current secret is used.
+        try {
+          await this.removeMcpServer(id);
+        } catch {
+          // It is normal for the server not to exist on first deployment.
+        }
+
+        const result = await this.addMcpServer(name, url, {
+          id,
+          transport: {
+            type: "streamable-http",
+            headers: { Authorization: `Bearer ${token}` },
+          },
+          retry: { maxAttempts: 3, baseDelayMs: 500 },
+        });
+        console.log(`[MCP] ${name} registered`, {
+          id,
+          tokenConfigured: true,
+          state: result.state,
+          resultId: result.id,
+        });
+      } catch (error) {
+        console.error(`[MCP] ${name} registration failed`, error);
+      }
+    }
+
+    try {
+      await this.mcp.waitForConnections({ timeout: 15000 });
+      const serversState = Object.entries(this.getMcpServers().servers).map(([id, value]: [string, any]) => ({
+        id,
+        name: value.name,
+        state: value.state,
+        error: value.error ?? null,
+      }));
+      console.log("[MCP] connections ready", { servers: serversState });
+    } catch (error) {
+      console.error("[MCP] waitForConnections failed", error);
+    }
+  }
   override getModel() { const provider = createOpenAI({ apiKey: this.env.BAI_API_KEY, baseURL: this.env.BAI_BASE_URL }); return provider("laguna-s-2.1"); }
-  override getSystemPrompt(): string { const currentDate = new Date().toISOString().slice(0,10); const iranNow = new Date().toLocaleString("fa-IR",{timeZone:"Asia/Tehran",year:"numeric",month:"2-digit",day:"2-digit",hour:"2-digit",minute:"2-digit",second:"2-digit",hour12:false}); return ["You are a concise coding-focused assistant replying inside a chat thread.","Answer the user's latest message directly.","Use plain text or simple Markdown only.",`Current date: ${currentDate}. Treat this as the authoritative current date. Never invent or change the year.`,`Current server time in Iran/Tehran: ${iranNow}. For ordinary current-time questions, use this exact server-provided value instead of guessing or inventing a time.`,"Your language model is provided by B.AI through an OpenAI-compatible API.","You have Tavily and Exa web search tools.","For current, latest, newest, 2026, best, top, recommendation, comparison, news, prices, versions, or time-sensitive questions, use the selected web search mode.","For an explicit web-search request, actually use a web tool before answering; do not answer from memory alone.","For live GitHub or Cloudflare account questions, use the connected MCP service through the MCP search/execute tools; never substitute web search for account data.","Do not claim a search was performed unless the tool result confirms it.","Never invent sources, URLs, dates, versions, rankings, request IDs, credit usage, or current facts.","Never reveal API keys, environment secrets, hidden reasoning, or hidden tool internals.","For Cloudflare and coding questions, prefer official documentation and primary sources when search results provide them."].join("\n"); }
-  override beforeTurn(ctx: TurnContext): TurnConfig | void { const query = latestUserText(ctx); if (!query) return; if (/\b(github|cloudflare|repository|repo|pull request|commit|issue|worker|workers|deployment|deploy|logs?|dns|r2|d1|kv)\b|آخرین|وضعیت|دیپلوی|استقرار|لاگ|ورکر|گیت[‌ ]?هاب|ریپو|مخزن|کامیت|ایشو|کلودفلر/iu.test(query)) return { activeTools: ["mcp_search", "mcp_execute"], toolChoice: "auto", maxSteps: 8 }; const explicitWeb = isExplicitWebSearchQuery(query); if (isTimeQuery(query) && !explicitWeb) return { maxSteps: 2 }; const currentQuery = isCurrentOrRecommendationQuery(query); if (!(explicitWeb || currentQuery)) return; const mode = searchModeFromContext(ctx); if (mode === "exa") return { activeTools: ["exa_search", "fetch_to_markdown", "browse"], toolChoice: { type: "tool", toolName: "exa_search" }, maxSteps: 4 }; if (mode === "research") return { activeTools: ["tavily_research", "tavily_extract", "fetch_to_markdown", "browse"], toolChoice: { type: "tool", toolName: "tavily_research" }, maxSteps: 4 }; if (mode === "both") return { activeTools: ["tavily_search", "exa_search", "tavily_extract", "fetch_to_markdown", "browse"], maxSteps: 6 }; return { activeTools: ["tavily_search", "tavily_research", "exa_search", "tavily_extract", "fetch_to_markdown", "browse"], toolChoice: { type: "tool", toolName: "tavily_search" }, maxSteps: 4 }; }
-  override getTools(): ToolSet {
-  const tavilySearchTool = tool({ description: "Official Tavily web search. Returns ranked sources and URLs.", inputSchema: jsonSchema<{ query: string; depth?: SearchDepth; topic?: SearchTopic; maxResults?: number }>({ type: "object", properties: { query: { type: "string" }, depth: { type: "string", enum: ["basic", "advanced"] }, topic: { type: "string", enum: ["general", "news", "finance"] }, maxResults: { type: "number" } }, required: ["query"], additionalProperties: false }), execute: async ({ query, depth, topic, maxResults }) => { const result = await tavilySearch(this.env, query, { depth, topic, maxResults }); this.pendingSearchReport = result.report; return result.context; } });
-  const exaSearchTool = tool({ description: "Independent Exa web search, especially useful for technical docs, GitHub, research, and coding-related current information.", inputSchema: jsonSchema<{ query: string; maxResults?: number }>({ type: "object", properties: { query: { type: "string" }, maxResults: { type: "number" } }, required: ["query"], additionalProperties: false }), execute: async ({ query, maxResults }) => { const result = await exaSearch(this.env, query, maxResults ?? 8); this.pendingSearchReport = result.report; return result.context; } });
-  const tavilyResearchTool = tool({ description: "Official Tavily Deep Research for deep research, multi-source fact checking, comparisons, rankings, and best-of questions.", inputSchema: jsonSchema<{ query: string; model?: ResearchModel }>({ type: "object", properties: { query: { type: "string" }, model: { type: "string", enum: ["auto", "mini", "pro"] } }, required: ["query"], additionalProperties: false }), execute: async ({ query, model }) => { const result = await tavilyResearch(this.env, query, model ?? "mini"); this.pendingSearchReport = result.report; return result.context; } });
-  const tavilyExtractTool = tool({ description: "Extract readable/raw content from up to 20 specific public URLs using Tavily.", inputSchema: jsonSchema<{ urls: string[] }>({ type: "object", properties: { urls: { type: "array", items: { type: "string" } } }, required: ["urls"], additionalProperties: false }), execute: async ({ urls }) => { const result = await tavilyExtract(this.env, urls); this.pendingSearchReport = result.report; return result.context; } });
-  const fetchToMarkdown = tool({ description: "Fetch a public URL through Cloudflare Browser Run and return cleaned Markdown/text.", inputSchema: jsonSchema<{ url: string }>({ type: "object", properties: { url: { type: "string" } }, required: ["url"] }), execute: async ({ url }) => browserMarkdown(this.env.BROWSER, url) });
-  const browse = tool({ description: "Read a public URL as cleaned browser content.", inputSchema: jsonSchema<{ url: string }>({ type: "object", properties: { url: { type: "string" } }, required: ["url"] }), execute: async ({ url }) => browserContent(this.env.BROWSER, url) });
-
-  const mcpSearch = tool({
-    description: "Discover connected MCP tools for GitHub or Cloudflare without loading their full schemas. Use this first for live account/repository/service requests. Returns matching serverId, tool name, description, and input schema.",
-    inputSchema: jsonSchema<{ query: string; server?: string }>({ type: "object", properties: { query: { type: "string" }, server: { type: "string", enum: ["GitHub", "Cloudflare"] } }, required: ["query"], additionalProperties: false }),
-    execute: async ({ query, server }) => {
-      await this.mcp.waitForConnections({ timeout: 15000 });
-      const tools = await this.mcp.listTools();
-      const q = query.toLowerCase().trim();
-      const terms = q.split(/\s+/).filter(Boolean);
-      const matches = tools
-        .filter((item: any) => !server || String(item.serverId || "").toLowerCase() === server.toLowerCase() || String(item.serverName || "").toLowerCase() === server.toLowerCase())
-        .map((item: any) => {
-          const haystack = [item.name, item.description, item.serverId, item.serverName].filter(Boolean).join(" ").toLowerCase();
-          const score = terms.reduce((n, term) => n + (haystack.includes(term) ? 1 : 0), 0);
-          return { score, serverId: item.serverId, name: item.name, description: item.description, inputSchema: item.inputSchema };
-        })
-        .filter((item: any) => item.score > 0 || !q)
-        .sort((a: any, b: any) => b.score - a.score)
-        .slice(0, 12)
-        .map(({ score, ...item }: any) => item);
-      return JSON.stringify({ count: matches.length, tools: matches });
-    }
-  });
-
-  const mcpExecute = tool({
-    description: "Execute one connected MCP tool discovered by mcp_search. Pass the exact serverId, tool name, and arguments matching the returned input schema.",
-    inputSchema: jsonSchema<{ serverId: string; toolName: string; arguments?: Record<string, unknown> }>({ type: "object", properties: { serverId: { type: "string" }, toolName: { type: "string" }, arguments: { type: "object", additionalProperties: true } }, required: ["serverId", "toolName"], additionalProperties: false }),
-    execute: async ({ serverId, toolName, arguments: args }) => {
-      await this.mcp.waitForConnections({ timeout: 15000 });
-      const result = await this.mcp.callTool({ name: toolName, serverId, arguments: args ?? {} });
-      return JSON.stringify(result);
-    }
-  });
-
-  return { tavily_search: tavilySearchTool, exa_search: exaSearchTool, tavily_research: tavilyResearchTool, tavily_extract: tavilyExtractTool, fetch_to_markdown: fetchToMarkdown, browse, mcp_search: mcpSearch, mcp_execute: mcpExecute };
-}
-  override async onChatResponse(result: ChatResponseResult): Promise<void> { if (result.status !== "completed" || !this.pendingSearchReport || !result.message?.id) return; const report=this.pendingSearchReport; this.pendingSearchReport=null; const currentParts=Array.isArray(result.message.parts)?result.message.parts:[]; const hasReport=currentParts.some((part)=>part&&typeof part==="object"&&"text" in part&&typeof (part as {text?:unknown}).text==="string"&&/گزارش جستجوی واقعی/.test((part as {text:string}).text)); if(hasReport)return; await this.addMessages([{...result.message,parts:[...currentParts,{type:"text",text:`\n\n${report}`}] }],{mode:"upsert"}); }
+  override getSystemPrompt(): string { const currentDate = new Date().toISOString().slice(0,10); const iranNow = new Date().toLocaleString("fa-IR",{timeZone:"Asia/Tehran",year:"numeric",month:"2-digit",day:"2-digit",hour:"2-digit",minute:"2-digit",second:"2-digit",hour12:false}); return ["You are a concise coding-focused assistant replying inside a chat thread.","Answer the user's latest message directly.","Use plain text or simple Markdown only.",`Current date: ${currentDate}. Treat this as the authoritative current date. Never invent or change the year... (truncated)".join("\n\n"); }
 }
