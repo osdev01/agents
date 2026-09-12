@@ -4,19 +4,27 @@ const mod = await import("./index");
 
 const conversationPrototype = mod.ConversationAgent.prototype as any;
 
-// MCP is assembled by the Think harness. Register external MCP servers once
-// during Agent startup and let Think expose their tools automatically.
+// Think assembles MCP tools before beforeTurn(). These are class-level settings
+// in the official Think lifecycle, so set them before the Agent starts rather
+// than inside onStart().
+conversationPrototype.waitForMcpConnections = { timeout: 15000 };
+conversationPrototype.includeMcpTools = true;
+
+// Register external MCP servers during Agent startup. addMcpServer() is
+// idempotent for the same name + URL, so it is safe across restarts/wakes.
 const originalOnStart = conversationPrototype.onStart;
 conversationPrototype.onStart = async function () {
-  this.waitForMcpConnections = { timeout: 15000 };
-  this.includeMcpTools = true;
-
   await originalOnStart?.call(this);
 
+  console.log("[MCP] configuration", {
+    githubConfigured: Boolean(this.env?.GITHUB_MCP_TOKEN),
+    cloudflareConfigured: Boolean(this.env?.CLOUDFLARE_MCP_TOKEN)
+  });
+
   const githubToken = this.env?.GITHUB_MCP_TOKEN;
-  if (githubToken && !this.__externalMcpRegistered?.github) {
+  if (githubToken) {
     try {
-      await this.addMcpServer("GitHub", "https://api.githubcopilot.com/mcp/", {
+      const result = await this.addMcpServer("GitHub", "https://api.githubcopilot.com/mcp/", {
         id: "github",
         transport: {
           type: "streamable-http",
@@ -24,22 +32,18 @@ conversationPrototype.onStart = async function () {
         },
         retry: { maxAttempts: 3, baseDelayMs: 500 }
       });
-      this.__externalMcpRegistered = {
-        ...(this.__externalMcpRegistered ?? {}),
-        github: true
-      };
-      console.log("[MCP] GitHub registered");
+      console.log("[MCP] GitHub ready", { state: result.state, id: result.id });
     } catch (error) {
-      console.error("[MCP] GitHub registration failed", error);
+      console.error("[MCP] GitHub registration/discovery failed", error);
     }
-  } else if (!githubToken) {
+  } else {
     console.log("[MCP] GitHub skipped: GITHUB_MCP_TOKEN is not configured");
   }
 
   const cloudflareToken = this.env?.CLOUDFLARE_MCP_TOKEN;
-  if (cloudflareToken && !this.__externalMcpRegistered?.cloudflare) {
+  if (cloudflareToken) {
     try {
-      await this.addMcpServer("Cloudflare API", "https://mcp.cloudflare.com/mcp", {
+      const result = await this.addMcpServer("Cloudflare API", "https://mcp.cloudflare.com/mcp", {
         id: "cloudflare",
         transport: {
           type: "streamable-http",
@@ -47,28 +51,43 @@ conversationPrototype.onStart = async function () {
         },
         retry: { maxAttempts: 3, baseDelayMs: 500 }
       });
-      this.__externalMcpRegistered = {
-        ...(this.__externalMcpRegistered ?? {}),
-        cloudflare: true
-      };
-      console.log("[MCP] Cloudflare registered");
+      console.log("[MCP] Cloudflare ready", { state: result.state, id: result.id });
     } catch (error) {
-      console.error("[MCP] Cloudflare registration failed", error);
+      console.error("[MCP] Cloudflare registration/discovery failed", error);
     }
-  } else if (!cloudflareToken) {
+  } else {
     console.log("[MCP] Cloudflare skipped: CLOUDFLARE_MCP_TOKEN is not configured");
+  }
+
+  try {
+    await this.mcp.waitForConnections({ timeout: 15000 });
+    const servers = this.getMcpServers?.() ?? [];
+    const tools = await this.mcp.listTools();
+    console.log("[MCP] startup state", {
+      servers: servers.map((server: any) => ({
+        id: server.id,
+        name: server.name,
+        state: server.state,
+        error: server.error ?? null
+      })),
+      toolCount: tools.length,
+      toolNames: tools.map((tool: any) => tool.name)
+    });
+  } catch (error) {
+    console.error("[MCP] startup wait/list failed", error);
   }
 };
 
-// Do not call this.mcp.getAITools() here. Think merges MCP tools into ctx.tools
-// before beforeTurn() and converts them to AI SDK tools itself. Manual injection
-// caused duplicate/inconsistent tool names and made activeTools unreliable.
+// Think assembles MCP tools before beforeTurn(). Do not call getAITools() here.
+// The important part is that service requests must not inherit the normal web
+// search activeTools/toolChoice from ConversationAgent.beforeTurn(), otherwise
+// Tavily/Exa can accidentally exclude the newly assembled MCP tools.
 const originalBeforeTurn = conversationPrototype.beforeTurn;
 conversationPrototype.beforeTurn = async function (ctx: any) {
   const config = (await originalBeforeTurn?.call(this, ctx)) ?? {};
   const toolNames = Object.keys(ctx?.tools ?? {});
   const mcpToolNames = toolNames.filter((name) =>
-    /github|cloudflare|mcp|codemode|tool_/i.test(name)
+    /github|cloudflare|mcp/i.test(name)
   );
 
   console.log("[MCP] assembled tool count", toolNames.length);
@@ -83,12 +102,33 @@ conversationPrototype.beforeTurn = async function (ctx: any) {
   const liveServiceRequest = /\b(last|latest|current|recent|status|deploy|deployment|build|worker|workers|logs?|cloudflare|github|repository|repo|pull request|commit|issue|dns|r2|d1|kv)\b/i.test(userText)
     || /(آخرین|وضعیت|دیپلوی|استقرار|لاگ|ورکر|گیت‌هاب|گیتهاب|ریپو|مخزن|کامیت|ایشو|کلودفلر)/iu.test(userText);
 
-  const serviceInstruction = liveServiceRequest
-    ? "\n\nLIVE SERVICE POLICY: This request concerns live GitHub/Cloudflare data. Use a matching connected MCP tool from the assembled tools before answering. Do not substitute Tavily or Exa for live account data. If no matching MCP tool is available or the MCP call fails, say so clearly and do not guess."
-    : "";
+  if (!liveServiceRequest) {
+    return config;
+  }
 
+  const serviceInstruction = "\n\nLIVE SERVICE POLICY: This request concerns live GitHub/Cloudflare data. Use a matching connected MCP tool from the assembled MCP tools before answering. Do not substitute Tavily or Exa for live account data. If no matching MCP tool is available or the MCP call fails, say so clearly and do not guess.";
+
+  if (!mcpToolNames.length) {
+    console.error("[MCP] live service request has no assembled MCP tools", {
+      query: userText.slice(0, 300)
+    });
+    return {
+      ...config,
+      activeTools: [],
+      toolChoice: "none",
+      maxSteps: 1,
+      system: `${config.system ?? ctx.system ?? ""}${serviceInstruction}\n\nMCP ERROR: No GitHub/Cloudflare MCP tools were available in this turn.`
+    };
+  }
+
+  // Replace, rather than merge, the web-search activeTools from the base agent.
+  // Otherwise its forced Tavily/Exa toolChoice can prevent MCP from ever being
+  // callable for a GitHub/Cloudflare request.
   return {
     ...config,
+    activeTools: mcpToolNames,
+    toolChoice: "auto",
+    maxSteps: Math.max(config.maxSteps ?? 1, 4),
     system: `${config.system ?? ctx.system ?? ""}${serviceInstruction}`
   };
 };
