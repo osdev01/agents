@@ -2,10 +2,10 @@ import { jsonSchema, tool } from "ai";
 
 const mod = await import("./index");
 
-const ConversationAgent = mod.ConversationAgent;
+const ConversationAgentClass = mod.ConversationAgent;
 
-const originalGetTools = ConversationAgent.prototype.getTools;
-const originalBeforeTurn = ConversationAgent.prototype.beforeTurn;
+const originalGetTools = ConversationAgentClass.prototype.getTools;
+const originalBeforeTurn = ConversationAgentClass.prototype.beforeTurn;
 
 function isLiveServiceQuery(query: string): boolean {
   return /(github|git hub|pull request|pull requests|issue|issues|repository|repo|commit|branch|cloudflare|worker|workers|durable object|pages|dns|zone|account|گیت.?هاب|پول.?ریکوئست|ایشیو|ریپازیتوری|کامیت|برنچ|کلودفلر|ورکر|دامین|زون|اکانت)/iu.test(query);
@@ -17,7 +17,7 @@ function latestUserText(ctx: any): string {
   return typeof message.content === "string" ? message.content : JSON.stringify(message.content ?? "");
 }
 
-ConversationAgent.prototype.getTools = function () {
+ConversationAgentClass.prototype.getTools = function () {
   const tools = { ...(originalGetTools.call(this) as any) };
   delete tools.execute;
 
@@ -61,15 +61,14 @@ ConversationAgent.prototype.getTools = function () {
       additionalProperties: false
     }),
     execute: async ({ serverId, name, arguments: args }: { serverId: string; name: string; arguments: Record<string, unknown> }) => {
-      const result = await this.mcp.callTool({ serverId, name, arguments: args });
-      return result;
+      return await this.mcp.callTool({ serverId, name, arguments: args });
     }
   });
 
   return tools;
 };
 
-ConversationAgent.prototype.beforeTurn = async function (ctx: any) {
+ConversationAgentClass.prototype.beforeTurn = async function (ctx: any) {
   const base = originalBeforeTurn ? await originalBeforeTurn.call(this, ctx) : undefined;
   const query = latestUserText(ctx);
   if (!isLiveServiceQuery(query)) return base;
@@ -80,7 +79,7 @@ ConversationAgent.prototype.beforeTurn = async function (ctx: any) {
   };
 };
 
-export const ConversationAgent = ConversationAgent;
+export const ConversationAgent = ConversationAgentClass;
 export const ThinkMessengerStateAgent = mod.ThinkMessengerStateAgent;
 export const getIngressAgentName = mod.getIngressAgentName;
 export const ChatIngressAgent = mod.ChatIngressAgent;
