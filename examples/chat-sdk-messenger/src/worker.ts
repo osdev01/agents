@@ -22,11 +22,11 @@ ConversationAgentClass.prototype.getTools = function () {
   delete tools.execute;
 
   tools.mcp_search = tool({
-    description: "Search the connected GitHub or Cloudflare MCP tool catalog. Use this before mcp_execute when you need live GitHub or Cloudflare data. Returns matching tool names, descriptions, server IDs, and input schemas.",
+    description: "Discover live tools on the connected GitHub or Cloudflare MCP servers. This is the required first step for GitHub/Cloudflare requests. Search the MCP catalog, then call mcp_execute with the exact serverId, name, and arguments returned here.",
     inputSchema: jsonSchema({
       type: "object",
       properties: {
-        query: { type: "string", description: "What live GitHub or Cloudflare operation is needed" },
+        query: { type: "string", description: "The user's live GitHub or Cloudflare task, expressed as a tool-discovery query" },
         server: { type: "string", enum: ["github", "cloudflare"] }
       },
       required: ["query"],
@@ -35,7 +35,9 @@ ConversationAgentClass.prototype.getTools = function () {
     execute: async ({ query, server }: { query: string; server?: string }) => {
       await this.mcp.waitForConnections({ timeout: 15000 });
       const all = await this.mcp.listTools();
-      const filtered = server ? all.filter((item: any) => String(item.serverId).toLowerCase() === server.toLowerCase()) : all;
+      const filtered = server
+        ? all.filter((item: any) => String(item.serverId).toLowerCase() === server.toLowerCase())
+        : all;
       const terms = query.toLowerCase().split(/\s+/).filter(Boolean);
       const scored = filtered.map((item: any) => {
         const haystack = [item.serverId, item.name, item.title, item.description].filter(Boolean).join(" ").toLowerCase();
@@ -52,26 +54,36 @@ ConversationAgentClass.prototype.getTools = function () {
           inputSchema: item.inputSchema
         };
       });
-      return { query, server: server ?? null, count: matches.length, matches };
+      return {
+        query,
+        server: server ?? null,
+        count: matches.length,
+        matches,
+        connectedServers: Object.entries(this.getMcpServers().servers).map(([id, value]: [string, any]) => ({ id, name: value.name, state: value.state, error: value.error ?? null }))
+      };
     }
   });
 
   tools.mcp_execute = tool({
-    description: "Execute one discovered GitHub or Cloudflare MCP tool using the exact serverId, name, and JSON arguments returned by mcp_search.",
+    description: "Execute exactly one live GitHub or Cloudflare MCP tool discovered by mcp_search. Never invent a tool name, serverId, or argument shape; use the values returned by mcp_search.",
     inputSchema: jsonSchema({
       type: "object",
       properties: {
-        serverId: { type: "string", description: "MCP server ID returned by mcp_search" },
+        serverId: { type: "string", description: "Exact MCP server ID returned by mcp_search" },
         name: { type: "string", description: "Exact MCP tool name returned by mcp_search" },
-        arguments: { type: "object", description: "Arguments matching the selected MCP tool input schema", additionalProperties: true }
+        arguments: { type: "object", description: "JSON arguments matching the selected MCP tool input schema", additionalProperties: true }
       },
       required: ["serverId", "name", "arguments"],
       additionalProperties: false
     }),
     execute: async ({ serverId, name, arguments: args }: { serverId: string; name: string; arguments: Record<string, unknown> }) => {
       await this.mcp.waitForConnections({ timeout: 15000 });
-      const result = await this.mcp.callTool({ serverId, name, arguments: args });
-      return result;
+      const available = await this.mcp.listTools();
+      const selected = available.find((item: any) => item.serverId === serverId && item.name === name);
+      if (!selected) {
+        throw new Error(`MCP tool not found: ${serverId}/${name}. Run mcp_search again to refresh the live catalog.`);
+      }
+      return await this.mcp.callTool({ serverId, name, arguments: args });
     }
   });
 
@@ -82,11 +94,28 @@ ConversationAgentClass.prototype.beforeTurn = async function (ctx: any) {
   const base = originalBeforeTurn ? await originalBeforeTurn.call(this, ctx) : undefined;
   const query = latestUserText(ctx);
   if (!isLiveServiceQuery(query)) return base;
-  return {
+
+  const connected = Object.entries(this.getMcpServers().servers).map(([id, value]: [string, any]) => `${id}:${value.state}${value.error ? ` (${value.error})` : ""}`).join(", ");
+  const system = [
+    (base as any)?.system ?? ctx.system,
+    "LIVE MCP RULE: This request concerns GitHub or Cloudflare. You have live MCP access through mcp_search and mcp_execute.",
+    "On the first step, call mcp_search using the user's request. Do not answer from memory or web search when the request asks about the connected GitHub/Cloudflare account.",
+    "After mcp_search returns an exact tool and input schema, call mcp_execute with those exact values. Then answer using the live tool result.",
+    `Current MCP connection states: ${connected || "none reported"}`
+  ].join("\n\n");
+
+  const config: any = {
     ...(base ?? {}),
+    system,
     activeTools: ["mcp_search", "mcp_execute"],
     maxSteps: Math.max((base as any)?.maxSteps ?? 6, 6)
   };
+
+  if (!ctx.continuation) {
+    config.toolChoice = { type: "tool", toolName: "mcp_search" };
+  }
+
+  return config;
 };
 
 export const ConversationAgent = ConversationAgentClass;
