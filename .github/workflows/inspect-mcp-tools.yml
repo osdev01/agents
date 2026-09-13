@@ -1,0 +1,33 @@
+name: Inspect MCP tool assembly
+on:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  inspect:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Inspect ConversationAgent getTools
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('examples/chat-sdk-messenger/src/intelligence/conversation-agent.ts')
+          lines=p.read_text().splitlines()
+          for i,line in enumerate(lines):
+              if 'getTools' in line or 'mcp_search' in line or 'mcp_execute' in line or 'beforeTurn' in line:
+                  print(f'{i+1}: {line}')
+                  for j in range(max(0,i-4), min(len(lines),i+25)):
+                      print(f'{j+1}: {lines[j]}')
+                  print('---')
+          PY
+          sed -n '1,180p' examples/chat-sdk-messenger/src/worker.ts
+      - name: Remove inspection workflow
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git rm .github/workflows/inspect-mcp-tools.yml
+          git commit -m "chore: remove MCP inspection workflow"
+          git push origin HEAD:main
