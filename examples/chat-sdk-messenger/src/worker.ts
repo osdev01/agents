@@ -1,4 +1,3 @@
-import { Think } from "@cloudflare/think";
 import { jsonSchema, tool } from "ai";
 
 const mod = await import("./index");
@@ -7,6 +6,7 @@ const ConversationAgentClass = mod.ConversationAgent;
 
 const originalGetTools = ConversationAgentClass.prototype.getTools;
 const originalBeforeTurn = ConversationAgentClass.prototype.beforeTurn;
+const originalOnStart = ConversationAgentClass.prototype.onStart;
 
 function isLiveServiceQuery(query: string): boolean {
   return /(github|git hub|pull request|pull requests|issue|issues|repository|repo|commit|branch|cloudflare|worker|workers|durable object|pages|dns|zone|account|گیت.?هاب|پول.?ریکوئست|ایشیو|ریپازیتوری|کامیت|برنچ|کلودفلر|ورکر|دامین|زون|اکانت)/iu.test(query);
@@ -18,84 +18,21 @@ function latestUserText(ctx: any): string {
   return typeof message.content === "string" ? message.content : JSON.stringify(message.content ?? "");
 }
 
-function mcpConfig(env: any) {
-  return [
-    ["GitHub", "https://api.githubcopilot.com/mcp/", env.GITHUB_MCP_TOKEN, "github"],
-    ["Cloudflare", "https://mcp.cloudflare.com/mcp", env.CLOUDFLARE_MCP_TOKEN, "cloudflare"],
-  ] as const;
-}
-
 ConversationAgentClass.prototype.onStart = async function (this: any, ...args: any[]) {
-  // IMPORTANT: do not call ConversationAgent.onStart(). Its current implementation
-  // performs blocking MCP registration and can prevent Telegram/model startup.
-  // Call the base Think lifecycle only, then register MCP in the background.
-  await (Think.prototype as any).onStart.apply(this, args);
-
-  for (const [name, url, token, id] of mcpConfig(this.env)) {
-    if (!token) {
-      console.warn(`[MCP] ${name} token is not configured`);
-      continue;
-    }
-
-    void this.addMcpServer(name, url, {
-      id,
-      transport: {
-        type: "streamable-http",
-        headers: { Authorization: `Bearer ${token}` },
-      },
-      retry: { maxAttempts: 2, baseDelayMs: 500 },
-    })
-      .then((result: any) => console.log(`[MCP] ${name} registered`, { id, state: result?.state, resultId: result?.id }))
-      .catch((error: unknown) => console.error(`[MCP] ${name} registration failed`, error));
-  }
+  // Use ConversationAgent's native MCP registration. The Agent SDK now handles
+  // MCP protocol negotiation (including the current stateless MCP revision),
+  // authentication headers, restoration, and connection waiting.
+  await originalOnStart.apply(this, args);
 };
 
 ConversationAgentClass.prototype.getTools = function (this: any) {
   const tools = { ...(originalGetTools.call(this) as any) };
   delete tools.execute;
 
-  tools.mcp_diagnose = tool({
-    description: "Diagnose outbound connectivity and authentication to the configured GitHub and Cloudflare MCP HTTP endpoints. Use this when MCP tools are unavailable or failing. Returns HTTP status and a short response excerpt, never the token.",
-    inputSchema: jsonSchema({
-      type: "object",
-      properties: {},
-      additionalProperties: false
-    }),
-    execute: async () => {
-      const results = [];
-      for (const [name, url, token, id] of mcpConfig(this.env)) {
-        if (!token) {
-          results.push({ id, name, configured: false, error: "token not configured" });
-          continue;
-        }
-        try {
-          const response = await fetch(url, {
-            method: "POST",
-            headers: {
-              Authorization: `Bearer ${token}`,
-              "Content-Type": "application/json",
-              Accept: "application/json, text/event-stream",
-              "MCP-Protocol-Version": "2026-07-28",
-              "Mcp-Method": "server/discover",
-              "Mcp-Name": "server/discover",
-            },
-            body: JSON.stringify({
-              jsonrpc: "2.0",
-              id: 1,
-              method: "server/discover",
-              params: {},
-            }),
-          });
-          const text = (await response.text()).replace(/\s+/g, " ").slice(0, 600);
-          results.push({ id, name, configured: true, httpStatus: response.status, ok: response.ok, contentType: response.headers.get("content-type"), response: text });
-        } catch (error: any) {
-          results.push({ id, name, configured: true, networkError: String(error?.message ?? error) });
-        }
-      }
-      return { results };
-    }
-  });
-
+  // Keep direct MCP schemas out of the model request. Think has
+  // includeMcpTools=false in ConversationAgent, so these two compact tools
+  // expose the live MCP connection without sending the entire GitHub/Cloudflare
+  // catalog to the model.
   tools.mcp_search = tool({
     description: "Search the connected GitHub or Cloudflare MCP tool catalog. Use this before mcp_execute when you need live GitHub or Cloudflare data. Returns matching tool names, descriptions, server IDs, and input schemas.",
     inputSchema: jsonSchema({
@@ -161,7 +98,7 @@ ConversationAgentClass.prototype.beforeTurn = async function (this: any, ctx: an
   if (!isLiveServiceQuery(query)) return base;
   return {
     ...(base ?? {}),
-    activeTools: ["mcp_diagnose", "mcp_search", "mcp_execute"],
+    activeTools: ["mcp_search", "mcp_execute"],
     maxSteps: Math.max((base as any)?.maxSteps ?? 6, 6)
   };
 };
