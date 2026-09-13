@@ -1,0 +1,77 @@
+name: one-shot MCP bridge patch
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: ${{ !contains(github.event.head_commit.message, 'fix: expose MCP bridge tools per turn') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Patch ConversationAgent
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('examples/chat-sdk-messenger/src/intelligence/conversation-agent.ts')
+          text = path.read_text()
+          old = 'if (/\\b(github|cloudflare|repository|repo|pull request|commit|issue|worker|workers|deployment|deploy|logs?|dns|r2|d1|kv)\\b|آخرین|وضعیت|دیپلوی|استقرار|لاگ|ورکر|گیت[‌ ]?هاب|ریپو|مخزن|کامیت|ایشو|کلودفلر/iu.test(query)) return { toolChoice: "auto", maxSteps: 8 };'
+          new = '''if (/\\b(github|cloudflare|repository|repo|pull request|commit|issue|worker|workers|deployment|deploy|logs?|dns|r2|d1|kv)\\b|آخرین|وضعیت|دیپلوی|استقرار|لاگ|ورکر|گیت[‌ ]?هاب|ریپو|مخزن|کامیت|ایشو|کلودفلر/iu.test(query)) {
+            return {
+              tools: {
+                github_mcp_search: tool({
+                  description: "Discover and inspect connected MCP tools for GitHub or Cloudflare. Returns serverId, tool name, description, and input schema.",
+                  inputSchema: jsonSchema<{ query: string; server?: string }>({ type: "object", properties: { query: { type: "string" }, server: { type: "string", enum: ["GitHub", "Cloudflare"] } }, required: ["query"], additionalProperties: false }),
+                  execute: async ({ query, server }) => {
+                    await this.mcp.waitForConnections({ timeout: 15000 });
+                    const tools = await this.mcp.listTools();
+                    const q = query.toLowerCase().trim();
+                    const terms = q.split(/\\s+/).filter(Boolean);
+                    const matches = tools
+                      .filter((item: any) => !server || String(item.serverId || "").toLowerCase() === server.toLowerCase() || String(item.serverName || "").toLowerCase() === server.toLowerCase())
+                      .map((item: any) => {
+                        const haystack = [item.name, item.description, item.serverId, item.serverName].filter(Boolean).join(" ").toLowerCase();
+                        const score = terms.reduce((n, term) => n + (haystack.includes(term) ? 1 : 0), 0);
+                        return { score, serverId: item.serverId, name: item.name, description: item.description, inputSchema: item.inputSchema };
+                      })
+                      .filter((item: any) => item.score > 0 || !q)
+                      .sort((a: any, b: any) => b.score - a.score)
+                      .slice(0, 12)
+                      .map(({ score, ...item }: any) => item);
+                    return JSON.stringify({ count: matches.length, tools: matches });
+                  }
+                }),
+                github_mcp_execute: tool({
+                  description: "Execute an exact connected MCP tool using its serverId, tool name, and arguments.",
+                  inputSchema: jsonSchema<{ serverId: string; toolName: string; arguments?: Record<string, unknown> }>({ type: "object", properties: { serverId: { type: "string" }, toolName: { type: "string" }, arguments: { type: "object", additionalProperties: true } }, required: ["serverId", "toolName"], additionalProperties: false }),
+                  execute: async ({ serverId, toolName, arguments: args }) => {
+                    await this.mcp.waitForConnections({ timeout: 15000 });
+                    const result = await this.mcp.callTool({ name: toolName, serverId, arguments: args ?? {} });
+                    return JSON.stringify(result);
+                  }
+                })
+              },
+              toolChoice: "auto",
+              maxSteps: 8
+            };
+          }'''
+          if old not in text:
+              raise SystemExit('target beforeTurn guard not found')
+          path.write_text(text.replace(old, new, 1))
+          PY
+
+      - name: Commit patch and remove one-shot workflow
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add examples/chat-sdk-messenger/src/intelligence/conversation-agent.ts .github/workflows/one-shot-mcp-bridge.yml
+          git rm .github/workflows/one-shot-mcp-bridge.yml
+          git commit -m "fix: expose MCP bridge tools per turn"
+          git push
