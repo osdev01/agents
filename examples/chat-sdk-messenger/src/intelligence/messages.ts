@@ -4,6 +4,7 @@ import type { UIMessage } from "ai";
 const ASK_COMMAND = /^\/ask(?:@\w+)?(?:\s+|$)/i;
 const MENU_COMMAND = /^\/menu(?:@\w+)?(?:\s|$)/i;
 const RESET_COMMAND = /^\/reset(?:@\w+)?(?:\s|$)/i;
+const CONVERSATION_AGENT_RUNTIME_VERSION = "mcp-v2";
 
 export interface AiRoutingInput {
   isDM: boolean;
@@ -12,7 +13,7 @@ export interface AiRoutingInput {
 }
 
 export function conversationNameForThread(thread: Pick<Thread, "id">): string {
-  return thread.id;
+  return `${thread.id}:${CONVERSATION_AGENT_RUNTIME_VERSION}`;
 }
 
 export function isAskCommand(text: string): boolean {
