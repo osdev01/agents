@@ -1,0 +1,51 @@
+name: Patch MCP bridge
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Patch ConversationAgent
+        run: |
+          python3 <<'PY'
+          from pathlib import Path
+          path = Path('examples/chat-sdk-messenger/src/intelligence/conversation-agent.ts')
+          text = path.read_text()
+
+          marker = '  override getModel() { const provider = createOpenAI({ apiKey: this.env.BAI_API_KEY, baseURL: this.env.BAI_BASE_URL }); return provider("laguna-s-2.1"); }'
+          if marker not in text:
+              raise SystemExit('getModel marker not found; refusing to patch')
+
+          if 'mcp_search:' not in text:
+              bridge = r'''\n  override getTools(): ToolSet {\n    return {\n      mcp_search: tool({\n        description: "Search the connected MCP tool catalog. Use this instead of inventing names such as mcp__github_* or mcp__cloudflare_*. Returns real tool names, server IDs, descriptions, and compact input schemas.",\n        inputSchema: jsonSchema<{ query: string; serverId?: string }>({\n          type: "object",\n          properties: {\n            query: { type: "string", description: "What capability or MCP tool are you looking for?" },\n            serverId: { type: "string", description: "Optional MCP server ID, for example github or cloudflare." }\n          },\n          required: ["query"]\n        }),\n        execute: async ({ query, serverId }) => {\n          const tools = this.mcp.listTools(serverId ? { serverId } : undefined);\n          const needle = query.trim().toLowerCase();\n          const matches = tools\n            .filter((item) => {\n              const haystack = [item.name, item.title, item.description].filter(Boolean).join(" ").toLowerCase();\n              return !needle || haystack.includes(needle);\n            })\n            .slice(0, 30)\n            .map((item) => ({\n              serverId: item.serverId,\n              name: item.name,\n              title: item.title ?? item.annotations?.title ?? item.name,\n              description: item.description ?? "",\n              inputSchema: item.inputSchema\n            }));\n          return { count: matches.length, tools: matches };\n        }\n      }),\n      mcp_execute: tool({\n        description: "Execute a real tool discovered from mcp_search. Always use the exact serverId and tool name returned by mcp_search; never invent MCP tool names.",\n        inputSchema: jsonSchema<{ serverId: string; name: string; arguments?: Record<string, unknown> }>({\n          type: "object",\n          properties: {\n            serverId: { type: "string", description: "Exact MCP server ID returned by mcp_search." },\n            name: { type: "string", description: "Exact MCP tool name returned by mcp_search." },\n            arguments: { type: "object", additionalProperties: true, description: "Arguments matching the discovered tool input schema." }\n          },\n          required: ["serverId", "name"]\n        }),\n        execute: async ({ serverId, name, arguments: args }) => {\n          return await this.mcp.callTool({ serverId, name, arguments: args ?? {} });\n        }\n      })\n    };\n  }\n'''
+              text = text.replace(marker, marker + bridge, 1)
+
+          old = '        try { await this.removeMcpServer(id); } catch { /* no previous registration */ }\n'
+          text = text.replace(old, '', 1)
+
+          path.write_text(text)
+          PY
+
+      - name: Validate patch
+        run: |
+          grep -n "override getTools\|mcp_search\|mcp_execute" examples/chat-sdk-messenger/src/intelligence/conversation-agent.ts
+          grep -n "removeMcpServer(id)" examples/chat-sdk-messenger/src/intelligence/conversation-agent.ts || true
+
+      - name: Commit patch and remove fixer workflow
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add examples/chat-sdk-messenger/src/intelligence/conversation-agent.ts .github/workflows/mcp-bridge-fix.yml
+          git rm .github/workflows/mcp-bridge-fix.yml
+          git commit -m "fix: expose MCP bridge tools to Think" || exit 0
+          git push origin HEAD:main
