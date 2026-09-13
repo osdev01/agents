@@ -33,7 +33,6 @@ export class ConversationAgent extends Think {
     for (const [name, url, token, id] of servers) {
       if (!token) { console.warn(`[MCP] ${name} token is not configured`); continue; }
       try {
-        try { await this.removeMcpServer(id); } catch { /* no previous registration */ }
         const result = await this.addMcpServer(name, url, { id, transport: { type: "streamable-http", headers: { Authorization: `Bearer ${token}` } }, retry: { maxAttempts: 3, baseDelayMs: 500 } });
         console.log(`[MCP] ${name} registered`, { id, tokenConfigured: true, state: result.state, resultId: result.id });
       } catch (error) { console.error(`[MCP] ${name} registration failed`, error); }
