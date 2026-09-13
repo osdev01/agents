@@ -24,7 +24,6 @@ async function tavilyExtract(env: Env, urls: string[]): Promise<{ context: strin
 
 export class ConversationAgent extends Think {
   private pendingSearchReport: string | null = null;
-  includeMcpTools = false;
   waitForMcpConnections = { timeout: 15000 };
   override async onStart() {
     await super.onStart();
@@ -58,4 +57,3 @@ export class ConversationAgent extends Think {
   return { tavily_search: tavilySearchTool, exa_search: exaSearchTool, tavily_research: tavilyResearchTool, tavily_extract: tavilyExtractTool, fetch_to_markdown: fetchToMarkdown, browse, mcp_search: mcpSearch, mcp_execute: mcpExecute };
 }
   override async onChatResponse(result: ChatResponseResult): Promise<void> { if (result.status !== "completed" || !this.pendingSearchReport || !result.message?.id) return; const report=this.pendingSearchReport; this.pendingSearchReport=null; const currentParts=Array.isArray(result.message.parts)?result.message.parts:[]; const hasReport=currentParts.some((part)=>part&&typeof part==="object"&&"text" in part&&typeof (part as {text?:unknown}).text==="string"&&/گزارش جستجوی واقعی/.test((part as {text:string}).text)); if(hasReport)return; await this.addMessages([{...result.message,parts:[...currentParts,{type:"text",text:`\n\n${report}`}] }],{mode:"upsert"}); }
-}
