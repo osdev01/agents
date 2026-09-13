@@ -6,7 +6,6 @@ const ConversationAgentClass = mod.ConversationAgent;
 
 const originalGetTools = ConversationAgentClass.prototype.getTools;
 const originalBeforeTurn = ConversationAgentClass.prototype.beforeTurn;
-const originalOnStart = ConversationAgentClass.prototype.onStart;
 
 function isLiveServiceQuery(query: string): boolean {
   return /(github|git hub|pull request|pull requests|issue|issues|repository|repo|commit|branch|cloudflare|worker|workers|durable object|pages|dns|zone|account|گیت.?هاب|پول.?ریکوئست|ایشیو|ریپازیتوری|کامیت|برنچ|کلودفلر|ورکر|دامین|زون|اکانت)/iu.test(query);
@@ -17,13 +16,6 @@ function latestUserText(ctx: any): string {
   if (!message) return "";
   return typeof message.content === "string" ? message.content : JSON.stringify(message.content ?? "");
 }
-
-ConversationAgentClass.prototype.onStart = async function (this: any, ...args: any[]) {
-  // Use ConversationAgent's native MCP registration. The Agent SDK now handles
-  // MCP protocol negotiation (including the current stateless MCP revision),
-  // authentication headers, restoration, and connection waiting.
-  await originalOnStart.apply(this, args);
-};
 
 ConversationAgentClass.prototype.getTools = function (this: any) {
   const tools = { ...(originalGetTools.call(this) as any) };
